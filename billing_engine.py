@@ -119,6 +119,21 @@ PARTNER_DETAIL_CALC_COLUMNS = [
     "total_fee",
 ]
 
+PARTNER_DETAIL_INTEGER_COLUMNS = [
+    "ACTIVE_EMPLOYEES",
+    "NUMBER_ACTIVE_CONTRACTORS",
+    "TOTAL_INDIVIDUAL_USERS",
+    "tier_start",
+    "tier_end",
+]
+
+PARTNER_DETAIL_FINANCIAL_COLUMNS = [
+    "er_fee",
+    "unit_price_iu",
+    "iu_fee",
+    "total_fee",
+]
+
 
 def normalize_column_name(column: Any) -> str:
     """Normalize a column name to lower snake_case."""
@@ -842,7 +857,32 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         file_path = partner_folder_path / file_name
 
         detail_df = group.loc[:, detail_columns].copy()
-        detail_df.to_excel(file_path, index=False)
+
+        # Normalize known numeric output columns before applying Excel formats.
+        for col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+            if col_name in detail_df.columns:
+                detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
+        for col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+            if col_name in detail_df.columns:
+                detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
+
+        with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+            sheet_name = "Partner Detail"
+            detail_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+            workbook = writer.book
+            worksheet = writer.sheets[sheet_name]
+            fmt_int = workbook.add_format({"num_format": "0"})
+            fmt_money = workbook.add_format({"num_format": "#,##0.00"})
+
+            for col_idx, col_name in enumerate(detail_df.columns):
+                col_fmt = None
+                if col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+                    col_fmt = fmt_int
+                elif col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+                    col_fmt = fmt_money
+                worksheet.set_column(col_idx, col_idx, 18, col_fmt)
+
         logger.info("Wrote partner detail file: %s", file_path)
 
 
