@@ -8,7 +8,7 @@ This script replicates the core fee logic from the supplied n8n workflow:
 4. Apply partner minimum true-up adjustments when applicable.
 5. Write:
    - ./outputs/NetSuite_Import_Staging.csv
-   - ./outputs/gep_partner_details/YYYY-MM_{PartnerName}_GEP_Detail.csv
+   - ./outputs/gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -107,6 +108,15 @@ PREFERRED_OUTPUT_COLUMNS = [
     "partner_minimum_shortfall",
     "partner_minimum_applied",
     "netsuite_customer_name",
+]
+
+PARTNER_DETAIL_CALC_COLUMNS = [
+    "tier_start",
+    "tier_end",
+    "er_fee",
+    "unit_price_iu",
+    "iu_fee",
+    "total_fee",
 ]
 
 
@@ -309,6 +319,17 @@ def sanitize_partner_name(name: Any) -> str:
     return s or "UnknownPartner"
 
 
+def safe_partner_display_name(name: Any) -> str:
+    """Build readable, filesystem-safe partner name for detail filenames."""
+    s = key(name)
+    if not s:
+        return "Unknown Partner"
+    s = s.replace("/", " ").replace("\\", " ")
+    s = re.sub(r"[^A-Za-z0-9 ._-]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or "Unknown Partner"
+
+
 def canonicalize_usage_rows(usage_df: pd.DataFrame) -> List[Dict[str, Any]]:
     """Convert usage dataframe rows to output-style dicts with uppercase columns."""
     records = usage_df.to_dict(orient="records")
@@ -422,6 +443,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     usage_df = normalize_dataframe_columns(usage_df)
     if usage_df.empty:
         raise BillingEngineError(f"Usage file is empty: {usage_file}")
+    usage_source_columns = [str(col).upper() for col in usage_df.columns]
 
     logger.info("Loading rules workbook...")
     sheets = load_rules_workbook(config_path)
@@ -792,6 +814,14 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     if "FOR_MONTH" not in master_df.columns:
         raise BillingEngineError("FOR_MONTH column missing from output data.")
 
+    detail_columns: List[str] = []
+    for col in usage_source_columns + PARTNER_DETAIL_CALC_COLUMNS:
+        if col not in detail_columns:
+            detail_columns.append(col)
+    for col in detail_columns:
+        if col not in master_df.columns:
+            master_df[col] = ""
+
     for partner_name, group in master_df.groupby("PARTNER_NAME", dropna=False):
         group_partner_name = key(partner_name)
         if not group_partner_name:
@@ -801,19 +831,25 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         for_month_candidates = [v for v in group["FOR_MONTH"].tolist() if key(v)]
         month_source = for_month_candidates[0] if for_month_candidates else ""
         parsed_month = parse_date(month_source) or for_month_any
-        year_month = f"{parsed_month.year:04d}-{parsed_month.month:02d}"
+        year_month = f"{parsed_month.year:04d}.{parsed_month.month:02d}"
 
-        safe_partner = sanitize_partner_name(group_partner_name)
-        file_name = f"{year_month}_{safe_partner}_GEP_Detail.csv"
-        file_path = partner_dir / file_name
-        group.to_csv(file_path, index=False)
+        partner_folder = sanitize_partner_name(group_partner_name)
+        partner_folder_path = partner_dir / partner_folder
+        os.makedirs(partner_folder_path, exist_ok=True)
+
+        partner_display = safe_partner_display_name(group_partner_name)
+        file_name = f"{partner_display} - {year_month}.xlsx"
+        file_path = partner_folder_path / file_name
+
+        detail_df = group.loc[:, detail_columns].copy()
+        detail_df.to_excel(file_path, index=False)
         logger.info("Wrote partner detail file: %s", file_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
     """CLI parser."""
     parser = argparse.ArgumentParser(
-        description="Replicate GEP n8n billing workflow into local CSV outputs."
+        description="Replicate GEP n8n billing workflow into staging CSV and partner Excel outputs."
     )
     parser.add_argument(
         "--inputs-dir",
@@ -826,7 +862,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--outputs-dir",
         default=str(DEFAULT_OUTPUTS_DIR),
-        help="Output directory for staging and partner detail CSVs.",
+        help="Output directory for staging CSV and partner detail Excel files.",
     )
     parser.add_argument(
         "--usage-prefix",
