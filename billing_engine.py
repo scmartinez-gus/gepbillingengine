@@ -612,7 +612,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Quantity": end_user_quantity,
                     "Unit Price": end_users_unit_price,
                     "Amount": end_users_amount,
-                    "Product": "",
+                    "Product": "GEP Usage",
                 }
             )
             line_amounts.append(end_users_amount)
@@ -639,7 +639,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Quantity": individual_quantity,
                     "Unit Price": individual_unit_price,
                     "Amount": individual_users_amount,
-                    "Product": "",
+                    "Product": "GEP Usage",
                 }
             )
             line_amounts.append(individual_users_amount)
@@ -660,7 +660,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Quantity": 1,
                     "Unit Price": "",
                     "Amount": minimum_trueup_amount,
-                    "Product": "",
+                    "Product": "GEP Minimums",
                 }
             )
             line_amounts.append(minimum_trueup_amount)
