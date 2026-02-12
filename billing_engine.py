@@ -822,6 +822,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     outputs_dir.mkdir(parents=True, exist_ok=True)
     partner_dir = outputs_dir / "gep_partner_details"
     partner_dir.mkdir(parents=True, exist_ok=True)
+    history_path = outputs_dir / "gep_billing_log"
+    history_path.mkdir(parents=True, exist_ok=True)
+    netsuite_template_path = outputs_dir / "gep_netsuite_invoice_import.csv"
+    logger.debug("NetSuite upload template path: %s", netsuite_template_path)
 
     output_columns = order_columns(out_rows)
     master_df = pd.DataFrame(out_rows, columns=output_columns)
