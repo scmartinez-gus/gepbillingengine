@@ -684,6 +684,123 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
     netsuite_df.to_csv(output_path, index=False)
 
 
+def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) -> None:
+    """Create a two-tab master billing dashboard workbook."""
+    data = df_usage.copy()
+
+    if "PARTNER_NAME" not in data.columns:
+        data["PARTNER_NAME"] = ""
+    if "PARTNER_ID" not in data.columns:
+        data["PARTNER_ID"] = ""
+    if "row_type" not in data.columns:
+        data["row_type"] = ""
+    if "ER_ID" not in data.columns:
+        data["ER_ID"] = ""
+    if "ER_NAME" not in data.columns:
+        data["ER_NAME"] = ""
+    if "user_fee_units_charged" not in data.columns:
+        data["user_fee_units_charged"] = 0
+    if "total_fee" not in data.columns:
+        data["total_fee"] = 0
+
+    data["_partner_name"] = data["PARTNER_NAME"].apply(key)
+    fallback_partner_id = data["PARTNER_ID"].apply(key)
+    data["_partner_name"] = data["_partner_name"].where(
+        data["_partner_name"] != "",
+        fallback_partner_id.where(fallback_partner_id != "", "Unknown Partner"),
+    )
+
+    row_type_norm = data["row_type"].fillna("").astype(str).str.lower()
+    usage = data.loc[row_type_norm == "usage"].copy()
+    minimums = data.loc[row_type_norm == "min_trueup"].copy()
+
+    usage["_er_key"] = usage.apply(
+        lambda r: f"id:{key(r.get('ER_ID'))}"
+        if key(r.get("ER_ID"))
+        else (f"name:{lower_key(r.get('ER_NAME'))}" if lower_key(r.get("ER_NAME")) else ""),
+        axis=1,
+    )
+    usage_for_end_users = usage.loc[usage["_er_key"] != ""].copy()
+
+    usage["_billable_users"] = pd.to_numeric(usage["user_fee_units_charged"], errors="coerce").fillna(0)
+    usage["_usage_revenue"] = pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0)
+    minimums["_minimum_revenue"] = pd.to_numeric(minimums["total_fee"], errors="coerce").fillna(0)
+
+    partners = sorted(set(data["_partner_name"].tolist()))
+    summary = pd.DataFrame(index=partners)
+    summary.index.name = "Partner Name"
+
+    summary["Active End Users"] = (
+        usage_for_end_users.groupby("_partner_name")["_er_key"].nunique().reindex(summary.index, fill_value=0)
+    )
+    summary["Billable Indiv. Users"] = (
+        usage.groupby("_partner_name")["_billable_users"].sum().reindex(summary.index, fill_value=0)
+    )
+    summary["Usage Revenue"] = (
+        usage.groupby("_partner_name")["_usage_revenue"].sum().reindex(summary.index, fill_value=0.0)
+    )
+    summary["Minimum Revenue"] = (
+        minimums.groupby("_partner_name")["_minimum_revenue"].sum().reindex(summary.index, fill_value=0.0)
+    )
+    summary["Total Billed"] = summary["Usage Revenue"] + summary["Minimum Revenue"]
+    summary["% from Minimums"] = summary.apply(
+        lambda r: (r["Minimum Revenue"] / r["Total Billed"]) if r["Total Billed"] else 0,
+        axis=1,
+    )
+
+    summary = summary.sort_values(by="Total Billed", ascending=False)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        summary.to_excel(writer, sheet_name="Executive Summary")
+        data.drop(columns=["_partner_name"], errors="ignore").to_excel(
+            writer, sheet_name="Source Data", index=False
+        )
+
+        workbook = writer.book
+        ws_summary = writer.sheets["Executive Summary"]
+        ws_source = writer.sheets["Source Data"]
+
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "align": "center",
+                "valign": "vcenter",
+                "bg_color": "#D9D9D9",
+            }
+        )
+        fmt_count = workbook.add_format({"num_format": "#,##0"})
+        fmt_currency = workbook.add_format({"num_format": "#,##0.00"})
+        fmt_percent = workbook.add_format({"num_format": "0%"})
+
+        ws_summary.set_row(0, None, header_fmt)
+
+        summary_formats = {
+            1: fmt_count,      # Active End Users
+            2: fmt_count,      # Billable Indiv. Users
+            3: fmt_currency,   # Usage Revenue
+            4: fmt_currency,   # Minimum Revenue
+            5: fmt_currency,   # Total Billed
+            6: fmt_percent,    # % from Minimums
+        }
+
+        summary_index_strings = [str(v) for v in summary.index.tolist()]
+        idx_width = max([len("Partner Name")] + [len(v) for v in summary_index_strings]) + 2
+        ws_summary.set_column(0, 0, max(15, min(20, idx_width)))
+
+        for col_idx, col_name in enumerate(summary.columns, start=1):
+            val_strings = [str(v) for v in summary[col_name].tolist()]
+            width = max([len(str(col_name))] + [len(v) for v in val_strings]) + 2
+            ws_summary.set_column(
+                col_idx,
+                col_idx,
+                max(15, min(20, width)),
+                summary_formats.get(col_idx),
+            )
+
+        ws_source.freeze_panes(1, 0)
+
+
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
@@ -1060,9 +1177,9 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     master_df = pd.DataFrame(out_rows, columns=output_columns)
 
     billing_period = f"{for_month_any.year:04d}.{for_month_any.month:02d}"
-    history_file_path = history_path / f"{billing_period}_Master_Calculation.csv"
-    master_df.to_csv(history_file_path, index=False)
-    logger.info("Wrote master calculation history file: %s", history_file_path)
+    history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
+    generate_master_billing_report(master_df, history_file_path)
+    logger.info("Wrote master billing report: %s", history_file_path)
 
     generate_netsuite_import_file(master_df, netsuite_template_path)
     logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
