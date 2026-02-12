@@ -7,7 +7,8 @@ This script replicates the core fee logic from the supplied n8n workflow:
 3. Calculate ER and IU fees from tier rules with ACH override behavior.
 4. Apply partner minimum true-up adjustments when applicable.
 5. Write:
-   - ./outputs/NetSuite_Import_Staging.csv
+   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Calculation.csv
+   - ./outputs/gep_netsuite_invoice_import.csv
    - ./outputs/gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
 """
 
@@ -455,6 +456,78 @@ def order_columns(rows: List[Dict[str, Any]]) -> List[str]:
     return ordered + extras
 
 
+def sanitize_partner_id_for_invoice(value: Any) -> str:
+    """Normalize partner id token used in invoice external ids."""
+    sanitized = re.sub(r"[^A-Za-z0-9]", "", key(value))
+    return sanitized or "UNKNOWN"
+
+
+def month_end(day: date) -> date:
+    """Return last calendar day for the month containing the provided date."""
+    if day.month == 12:
+        first_next = date(day.year + 1, 1, 1)
+    else:
+        first_next = date(day.year, day.month + 1, 1)
+    return first_next - timedelta(days=1)
+
+
+def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> None:
+    """Create NetSuite invoice import CSV with three billing lines per group."""
+    required = {"netsuite_customer_name", "FOR_MONTH", "PARTNER_ID", "er_fee", "iu_fee", "total_fee", "row_type"}
+    missing = sorted(col for col in required if col not in df_usage.columns)
+    if missing:
+        raise BillingEngineError(
+            f"Cannot generate NetSuite import: missing required columns {missing}"
+        )
+
+    rows: List[Dict[str, Any]] = []
+    grouped = df_usage.groupby(["netsuite_customer_name", "FOR_MONTH"], dropna=False)
+    for (customer_name, for_month), group in grouped:
+        parsed_month = parse_date(for_month)
+        if parsed_month is None:
+            continue
+        billing_month = date(parsed_month.year, parsed_month.month, 1)
+        transaction_date = month_end(billing_month)
+        yyyymm = f"{billing_month.year:04d}{billing_month.month:02d}"
+
+        partner_values = group["PARTNER_ID"].tolist()
+        partner_id_raw = next((v for v in partner_values if key(v)), "")
+        partner_token = sanitize_partner_id_for_invoice(partner_id_raw)
+        invoice_external_id = f"INV-GEP-{yyyymm}-{partner_token}"
+
+        end_users_amount = round2(pd.to_numeric(group["er_fee"], errors="coerce").fillna(0).sum())
+        individual_users_amount = round2(pd.to_numeric(group["iu_fee"], errors="coerce").fillna(0).sum())
+
+        min_mask = group["row_type"].fillna("").astype(str).str.lower() == "min_trueup"
+        minimum_trueup_amount = round2(
+            pd.to_numeric(group.loc[min_mask, "total_fee"], errors="coerce").fillna(0).sum()
+        )
+
+        line_defs = [
+            ("Embedded Payroll", "End Users", end_users_amount),
+            ("Embedded Payroll", "Individual Users", individual_users_amount),
+            ("Embedded Payroll : Monthly Minimum", "Minimum True-up", minimum_trueup_amount),
+        ]
+        for item, desc, amount in line_defs:
+            rows.append(
+                {
+                    "Invoice External ID": invoice_external_id,
+                    "Transaction Date": transaction_date.isoformat(),
+                    "Customer": key(customer_name),
+                    "Item": item,
+                    "Desc": desc,
+                    "Amount": amount,
+                }
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    netsuite_df = pd.DataFrame(
+        rows,
+        columns=["Invoice External ID", "Transaction Date", "Customer", "Item", "Desc", "Amount"],
+    )
+    netsuite_df.to_csv(output_path, index=False)
+
+
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
@@ -830,9 +903,13 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     output_columns = order_columns(out_rows)
     master_df = pd.DataFrame(out_rows, columns=output_columns)
 
-    master_path = outputs_dir / "NetSuite_Import_Staging.csv"
-    master_df.to_csv(master_path, index=False)
-    logger.info("Wrote master staging file: %s", master_path)
+    billing_period = f"{for_month_any.year:04d}.{for_month_any.month:02d}"
+    history_file_path = history_path / f"{billing_period}_Master_Calculation.csv"
+    master_df.to_csv(history_file_path, index=False)
+    logger.info("Wrote master calculation history file: %s", history_file_path)
+
+    generate_netsuite_import_file(master_df, netsuite_template_path)
+    logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
 
     # Partner split files.
     if "PARTNER_NAME" not in master_df.columns:
