@@ -24,7 +24,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError as exc:  # pragma: no cover - import guard for runtime setup
+    raise SystemExit(
+        "Missing dependency: pandas/openpyxl. Install with: python3 -m pip install pandas openpyxl"
+    ) from exc
 
 
 class BillingEngineError(Exception):
