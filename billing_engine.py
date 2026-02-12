@@ -32,6 +32,13 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime setup
         "Missing dependency: pandas/openpyxl. Install with: python3 -m pip install pandas openpyxl"
     ) from exc
 
+try:  # pragma: no cover - optional runtime dependency by mode
+    import xlsxwriter  # noqa: F401
+
+    HAS_XLSXWRITER = True
+except ImportError:
+    HAS_XLSXWRITER = False
+
 
 class BillingEngineError(Exception):
     """Raised when input data or configuration is invalid."""
@@ -118,6 +125,21 @@ PARTNER_DETAIL_CALC_COLUMNS = [
     "iu_fee",
     "total_fee",
 ]
+
+PARTNER_DETAIL_INTEGER_COLUMNS = {
+    "ACTIVE_EMPLOYEES",
+    "NUMBER_ACTIVE_CONTRACTORS",
+    "TOTAL_INDIVIDUAL_USERS",
+    "tier_start",
+    "tier_end",
+}
+
+PARTNER_DETAIL_FINANCIAL_COLUMNS = {
+    "er_fee",
+    "unit_price_iu",
+    "iu_fee",
+    "total_fee",
+}
 
 
 def normalize_column_name(column: Any) -> str:
@@ -330,6 +352,40 @@ def safe_partner_display_name(name: Any) -> str:
     return s or "Unknown Partner"
 
 
+def write_partner_excel_mode_1(detail_df: pd.DataFrame, file_path: Path) -> None:
+    """Write a partner detail workbook using accountant-friendly formats."""
+    export_df = detail_df.copy()
+
+    for col in PARTNER_DETAIL_INTEGER_COLUMNS:
+        if col in export_df.columns:
+            export_df[col] = pd.to_numeric(export_df[col], errors="coerce")
+    for col in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+        if col in export_df.columns:
+            export_df[col] = pd.to_numeric(export_df[col], errors="coerce")
+
+    with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+        sheet_name = "Final Billing"
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+        workbook = writer.book
+        worksheet = writer.sheets[sheet_name]
+        integer_fmt = workbook.add_format({"num_format": "0"})
+        financial_fmt = workbook.add_format({"num_format": "#,##0.00"})
+
+        for col_idx, col_name in enumerate(export_df.columns):
+            values = export_df[col_name].fillna("").astype(str)
+            max_len = max([len(str(col_name))] + values.map(len).tolist())
+            col_width = max(15, min(40, max_len + 2))
+
+            col_format = None
+            if col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+                col_format = financial_fmt
+            elif col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+                col_format = integer_fmt
+
+            worksheet.set_column(col_idx, col_idx, col_width, col_format)
+
+
 def canonicalize_usage_rows(usage_df: pd.DataFrame) -> List[Dict[str, Any]]:
     """Convert usage dataframe rows to output-style dicts with uppercase columns."""
     records = usage_df.to_dict(orient="records")
@@ -433,7 +489,14 @@ def order_columns(rows: List[Dict[str, Any]]) -> List[str]:
     return ordered + extras
 
 
-def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
+def run_billing_engine(
+    inputs_dir: Path,
+    outputs_dir: Path,
+    usage_prefix: str,
+    config_filename: str,
+    logger: logging.Logger,
+    mode: int = 1,
+) -> None:
     """Main workflow execution."""
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
     config_path = inputs_dir / config_filename
@@ -813,6 +876,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         raise BillingEngineError("PARTNER_NAME column missing from output data.")
     if "FOR_MONTH" not in master_df.columns:
         raise BillingEngineError("FOR_MONTH column missing from output data.")
+    if mode == 1 and not HAS_XLSXWRITER:
+        raise BillingEngineError(
+            "Mode 1 requires xlsxwriter. Install with: python3 -m pip install xlsxwriter"
+        )
 
     detail_columns: List[str] = []
     for col in usage_source_columns + PARTNER_DETAIL_CALC_COLUMNS:
@@ -842,7 +909,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         file_path = partner_folder_path / file_name
 
         detail_df = group.loc[:, detail_columns].copy()
-        detail_df.to_excel(file_path, index=False)
+        if mode == 1:
+            write_partner_excel_mode_1(detail_df, file_path)
+        else:
+            detail_df.to_excel(file_path, index=False)
         logger.info("Wrote partner detail file: %s", file_path)
 
 
@@ -863,6 +933,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--outputs-dir",
         default=str(DEFAULT_OUTPUTS_DIR),
         help="Output directory for staging CSV and partner detail Excel files.",
+    )
+    parser.add_argument(
+        "--mode",
+        type=int,
+        default=1,
+        help=(
+            "Execution mode. Mode 1 writes Final Billing files with accountant "
+            "number formats (#,##0.00 for financials)."
+        ),
     )
     parser.add_argument(
         "--usage-prefix",
@@ -904,6 +983,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             usage_prefix=args.usage_prefix,
             config_filename=args.config_file,
             logger=logger,
+            mode=args.mode,
         )
     except BillingEngineError as exc:
         logger.error("%s", exc)
