@@ -32,6 +32,13 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime setup
         "Missing dependency: pandas/openpyxl. Install with: python3 -m pip install pandas openpyxl"
     ) from exc
 
+try:
+    import xlsxwriter  # noqa: F401
+except ImportError as exc:  # pragma: no cover - import guard for runtime setup
+    raise SystemExit(
+        "Missing dependency: xlsxwriter. Install with: python3 -m pip install xlsxwriter"
+    ) from exc
+
 
 class BillingEngineError(Exception):
     """Raised when input data or configuration is invalid."""
