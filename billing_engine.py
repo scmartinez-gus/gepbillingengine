@@ -2,8 +2,8 @@
 """Build GEP billing output files from usage + billing rule inputs.
 
 This script replicates the core fee logic from the supplied n8n workflow:
-1. Detect latest usage CSV in ./inputs beginning with "gepusage".
-2. Load ./inputs/gep_billing_rules.xlsx tabs: Pricing, Minimums, Config, Mapping.
+1. Detect latest usage CSV in the configured inputs directory beginning with "gepusage".
+2. Load gep_billing_rules.xlsx tabs: Pricing, Minimums, Config, Mapping.
 3. Calculate ER and IU fees from tier rules with ACH override behavior.
 4. Apply partner minimum true-up adjustments when applicable.
 5. Write:
@@ -48,7 +48,12 @@ class Tier:
     included: int
 
 
-DEFAULT_INPUTS_DIR = Path("inputs")
+DEFAULT_INPUTS_DIR = Path(
+    "/Users/sam.martinez/Library/CloudStorage/GoogleDrive-sam.martinez@gusto.com/"
+    "Shared drives/Accounting Shared Drive (Public)/8 - Team Perm Files/"
+    "Revenue Accounting - Perm Files/Embedded Payroll/Invoice Support/"
+    "billing_engine_test/inputs"
+)
 DEFAULT_OUTPUTS_DIR = Path("outputs")
 DEFAULT_CONFIG_FILE = "gep_billing_rules.xlsx"
 DEFAULT_USAGE_PREFIX = "gepusage"
@@ -813,7 +818,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--inputs-dir",
         default=str(DEFAULT_INPUTS_DIR),
-        help="Input directory containing usage CSV and rules workbook.",
+        help=(
+            "Input directory containing usage CSV and rules workbook. "
+            "Defaults to the configured Google Drive path."
+        ),
     )
     parser.add_argument(
         "--outputs-dir",
