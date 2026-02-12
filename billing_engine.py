@@ -472,59 +472,215 @@ def month_end(day: date) -> date:
 
 
 def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> None:
-    """Create NetSuite invoice import CSV with three billing lines per group."""
-    required = {"netsuite_customer_name", "FOR_MONTH", "PARTNER_ID", "er_fee", "iu_fee", "total_fee", "row_type"}
+    """Create NetSuite invoice import CSV using strict BRD schema and rules."""
+    logger = logging.getLogger("billing_engine")
+    required = {
+        "netsuite_customer_name",
+        "FOR_MONTH",
+        "PARTNER_ID",
+        "row_type",
+        "ER_ID",
+        "ER_NAME",
+        "er_fee",
+        "iu_fee",
+        "total_fee",
+        "user_fee_units_charged",
+        "unit_price_er",
+        "unit_price_iu",
+    }
     missing = sorted(col for col in required if col not in df_usage.columns)
     if missing:
         raise BillingEngineError(
             f"Cannot generate NetSuite import: missing required columns {missing}"
         )
 
+    output_columns = [
+        "Customer",
+        "Invoice External ID",
+        "Memo",
+        "Transaction Date",
+        "Item",
+        "Description",
+        "Quantity",
+        "Unit Price",
+        "Amount",
+        "Product",
+    ]
+
+    # Customer-level unit price audit warnings.
+    usage_mask_all = df_usage["row_type"].fillna("").astype(str).str.lower() == "usage"
+    usage_all = df_usage.loc[usage_mask_all].copy()
+    for customer_name, cust_group in usage_all.groupby("netsuite_customer_name", dropna=False):
+        er_prices = sorted(
+            set(
+                float(v)
+                for v in pd.to_numeric(cust_group["unit_price_er"], errors="coerce")
+                .dropna()
+                .tolist()
+            )
+        )
+        iu_prices = sorted(
+            set(
+                float(v)
+                for v in pd.to_numeric(cust_group["unit_price_iu"], errors="coerce")
+                .dropna()
+                .tolist()
+            )
+        )
+        if len(er_prices) > 1:
+            logger.warning(
+                "Unit price check warning for customer '%s': multiple unit_price_er values %s",
+                key(customer_name),
+                er_prices,
+            )
+        if len(iu_prices) > 1:
+            logger.warning(
+                "Unit price check warning for customer '%s': multiple unit_price_iu values %s",
+                key(customer_name),
+                iu_prices,
+            )
+
     rows: List[Dict[str, Any]] = []
-    grouped = df_usage.groupby(["netsuite_customer_name", "FOR_MONTH"], dropna=False)
-    for (customer_name, for_month), group in grouped:
+    grouped = df_usage.groupby(["netsuite_customer_name", "FOR_MONTH", "PARTNER_ID"], dropna=False)
+    for (customer_name, for_month, partner_id_raw), group in grouped:
         parsed_month = parse_date(for_month)
         if parsed_month is None:
+            logger.warning(
+                "Skipping NetSuite invoice group due to invalid FOR_MONTH. customer='%s', partner_id='%s', for_month='%s'",
+                key(customer_name),
+                key(partner_id_raw),
+                key(for_month),
+            )
             continue
+
         billing_month = date(parsed_month.year, parsed_month.month, 1)
         transaction_date = month_end(billing_month)
         yyyymm = f"{billing_month.year:04d}{billing_month.month:02d}"
+        memo = billing_month.strftime("%B %Y Invoice")
 
-        partner_values = group["PARTNER_ID"].tolist()
-        partner_id_raw = next((v for v in partner_values if key(v)), "")
         partner_token = sanitize_partner_id_for_invoice(partner_id_raw)
         invoice_external_id = f"INV-GEP-{yyyymm}-{partner_token}"
 
-        end_users_amount = round2(pd.to_numeric(group["er_fee"], errors="coerce").fillna(0).sum())
-        individual_users_amount = round2(pd.to_numeric(group["iu_fee"], errors="coerce").fillna(0).sum())
-
+        usage_mask = group["row_type"].fillna("").astype(str).str.lower() == "usage"
         min_mask = group["row_type"].fillna("").astype(str).str.lower() == "min_trueup"
-        minimum_trueup_amount = round2(
-            pd.to_numeric(group.loc[min_mask, "total_fee"], errors="coerce").fillna(0).sum()
-        )
+        usage_group = group.loc[usage_mask].copy()
+        min_group = group.loc[min_mask].copy()
 
-        line_defs = [
-            ("Embedded Payroll", "End Users", end_users_amount),
-            ("Embedded Payroll", "Individual Users", individual_users_amount),
-            ("Embedded Payroll : Monthly Minimum", "Minimum True-up", minimum_trueup_amount),
-        ]
-        for item, desc, amount in line_defs:
+        line_amounts: List[float] = []
+
+        if not usage_group.empty:
+            # Line A - End Users.
+            er_keys: set[str] = set()
+            for _, usage_row in usage_group.iterrows():
+                er_id = key(usage_row.get("ER_ID"))
+                if er_id:
+                    er_keys.add(f"id:{er_id}")
+                else:
+                    er_name = lower_key(usage_row.get("ER_NAME"))
+                    if er_name:
+                        er_keys.add(f"name:{er_name}")
+
+            end_user_quantity = len(er_keys)
+            end_users_amount = round2(
+                pd.to_numeric(usage_group["er_fee"], errors="coerce").fillna(0).sum()
+            )
+            end_users_unit_price = round2(end_users_amount / end_user_quantity) if end_user_quantity else 0.0
+
+            er_unit_prices = sorted(
+                set(
+                    float(v)
+                    for v in pd.to_numeric(usage_group["unit_price_er"], errors="coerce")
+                    .dropna()
+                    .tolist()
+                )
+            )
+            if len(er_unit_prices) > 1:
+                logger.warning(
+                    "Unit price check warning for invoice '%s': multiple unit_price_er values %s",
+                    invoice_external_id,
+                    er_unit_prices,
+                )
+
             rows.append(
                 {
-                    "Invoice External ID": invoice_external_id,
-                    "Transaction Date": transaction_date.isoformat(),
                     "Customer": key(customer_name),
-                    "Item": item,
-                    "Desc": desc,
-                    "Amount": amount,
+                    "Invoice External ID": invoice_external_id,
+                    "Memo": memo,
+                    "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                    "Item": "Embedded Payroll",
+                    "Description": "End Users",
+                    "Quantity": end_user_quantity,
+                    "Unit Price": end_users_unit_price,
+                    "Amount": end_users_amount,
+                    "Product": "",
                 }
+            )
+            line_amounts.append(end_users_amount)
+
+            # Line B - Individual Users.
+            individual_quantity = round2(
+                pd.to_numeric(usage_group["user_fee_units_charged"], errors="coerce").fillna(0).sum()
+            )
+            individual_users_amount = round2(
+                pd.to_numeric(usage_group["iu_fee"], errors="coerce").fillna(0).sum()
+            )
+            individual_unit_price = (
+                round2(individual_users_amount / individual_quantity) if individual_quantity else 0.0
+            )
+
+            rows.append(
+                {
+                    "Customer": key(customer_name),
+                    "Invoice External ID": invoice_external_id,
+                    "Memo": memo,
+                    "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                    "Item": "Embedded Payroll",
+                    "Description": "Individual Users",
+                    "Quantity": individual_quantity,
+                    "Unit Price": individual_unit_price,
+                    "Amount": individual_users_amount,
+                    "Product": "",
+                }
+            )
+            line_amounts.append(individual_users_amount)
+
+        # Line C - Minimum True-up.
+        if not min_group.empty:
+            minimum_trueup_amount = round2(
+                pd.to_numeric(min_group["total_fee"], errors="coerce").fillna(0).sum()
+            )
+            rows.append(
+                {
+                    "Customer": key(customer_name),
+                    "Invoice External ID": invoice_external_id,
+                    "Memo": memo,
+                    "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                    "Item": "Embedded Payroll : Monthly Minimum",
+                    "Description": "Minimum True-up",
+                    "Quantity": 1,
+                    "Unit Price": "",
+                    "Amount": minimum_trueup_amount,
+                    "Product": "",
+                }
+            )
+            line_amounts.append(minimum_trueup_amount)
+
+        input_total = round2(
+            pd.to_numeric(usage_group["er_fee"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(usage_group["iu_fee"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(min_group["total_fee"], errors="coerce").fillna(0).sum()
+        )
+        output_total = round2(sum(line_amounts))
+        if abs(input_total - output_total) > 0.01:
+            logger.warning(
+                "Tie-out warning for invoice '%s': input_fees=%s output_line_amounts=%s",
+                invoice_external_id,
+                input_total,
+                output_total,
             )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    netsuite_df = pd.DataFrame(
-        rows,
-        columns=["Invoice External ID", "Transaction Date", "Customer", "Item", "Desc", "Amount"],
-    )
+    netsuite_df = pd.DataFrame(rows, columns=output_columns)
     netsuite_df.to_csv(output_path, index=False)
 
 
