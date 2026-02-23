@@ -59,6 +59,7 @@ class Tier:
     company_fee: float
     user_fee: float
     included: int
+    tier_type: str = "ALL_IN"
 
 
 DEFAULT_INPUTS_DIR = Path(
@@ -847,6 +848,17 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     usage_df = normalize_dataframe_columns(usage_df)
     if usage_df.empty:
         raise BillingEngineError(f"Usage file is empty: {usage_file}")
+    if "partner_name" not in usage_df.columns:
+        usage_df["partner_name"] = ""
+    if "first_billable_activity_date" not in usage_df.columns:
+        usage_df["first_billable_activity_date"] = pd.NaT
+    usage_df["first_billable_activity_date"] = pd.to_datetime(
+        usage_df["first_billable_activity_date"], errors="coerce"
+    )
+    usage_df = usage_df.sort_values(
+        by=["partner_name", "first_billable_activity_date"],
+        ascending=[True, True],
+    ).reset_index(drop=True)
     usage_source_columns = [str(col).upper() for col in usage_df.columns]
 
     logger.info("Loading rules workbook...")
@@ -915,7 +927,13 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     for p_key in min_sched_by_partner:
         min_sched_by_partner[p_key].sort(key=lambda r: r["start"])
 
-    # Build tier rules by partner.
+    # Build tier rules by partner and normalize tier mode.
+    if "tier_type" not in pricing_df.columns:
+        pricing_df["tier_type"] = "ALL_IN"
+    pricing_df["tier_type"] = pricing_df["tier_type"].fillna("").astype(str).str.strip()
+    pricing_df.loc[pricing_df["tier_type"] == "", "tier_type"] = "ALL_IN"
+    pricing_df["tier_type"] = pricing_df["tier_type"].str.upper()
+
     tiers_by_partner: Dict[str, List[Tier]] = {}
     for row in pricing_df.to_dict(orient="records"):
         p_key = pricing_partner_key(row)
@@ -926,6 +944,9 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             tier_end = float("inf")
         else:
             tier_end = num(end_value)
+        tier_type_value = key(row.get("tier_type")).upper() or "ALL_IN"
+        if tier_type_value not in {"ALL_IN", "SPLIT"}:
+            tier_type_value = "ALL_IN"
         tier = Tier(
             metric=metric_norm(value_from_aliases(row, ["tier_metric", "metric"])),
             start=num(value_from_aliases(row, ["tierstart", "tier_start", "start"])),
@@ -935,31 +956,51 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             included=1
             if num(value_from_aliases(row, ["include_iu", "included_users_in_company_fee", "included"])) > 0
             else 0,
+            tier_type=tier_type_value,
         )
         tiers_by_partner.setdefault(p_key, []).append(tier)
     for p_key in tiers_by_partner:
         tiers_by_partner[p_key].sort(key=lambda t: t.start)
 
-    # Aggregate partner drivers from usage (ER count and IU total).
-    agg_by_partner: Dict[str, Dict[str, Any]] = {}
+    partner_tier_mode: Dict[str, str] = {}
+    for p_key, partner_tiers in tiers_by_partner.items():
+        tier_types = {tier.tier_type for tier in partner_tiers}
+        if len(tier_types) > 1:
+            logger.warning(
+                "Partner '%s' has mixed tier_type values %s. SPLIT takes precedence.",
+                p_key,
+                sorted(tier_types),
+            )
+        partner_tier_mode[p_key] = "SPLIT" if "SPLIT" in tier_types else "ALL_IN"
+
+    billable_units_by_partner: Dict[str, int] = {}
     for row in usage_rows:
         p_key = usage_partner_key(row)
         c_key = usage_company_key(row)
         if not p_key or not c_key:
             continue
-        users = num(row.get("TOTAL_INDIVIDUAL_USERS"))
-        agg_entry = agg_by_partner.setdefault(
-            p_key, {"companies": set(), "users_by_company": {}}
-        )
-        agg_entry["companies"].add(c_key)
-        previous = agg_entry["users_by_company"].get(c_key, 0.0)
-        agg_entry["users_by_company"][c_key] = max(users, previous)
+        billable_units_by_partner[p_key] = billable_units_by_partner.get(p_key, 0) + 1
 
-    driver: Dict[str, Dict[str, float]] = {}
-    for p_key, agg_entry in agg_by_partner.items():
-        er_count = float(len(agg_entry["companies"]))
-        iu_sum = float(sum(num(v) for v in agg_entry["users_by_company"].values()))
-        driver[p_key] = {"ER": er_count, "IU": iu_sum}
+    def select_tier_for_value(tiers: List[Tier], value: float) -> Optional[Tier]:
+        if not tiers:
+            return None
+        matched = [tier for tier in tiers if tier.start <= value <= tier.end]
+        if matched:
+            return max(matched, key=lambda tier: tier.start)
+        return max(tiers, key=lambda tier: tier.start)
+
+    all_in_tier_by_partner: Dict[str, Optional[Tier]] = {}
+    split_tiers_by_partner: Dict[str, List[Tier]] = {}
+    for p_key, partner_tiers in tiers_by_partner.items():
+        split_tiers = [tier for tier in partner_tiers if tier.tier_type == "SPLIT"]
+        all_in_tiers = [tier for tier in partner_tiers if tier.tier_type == "ALL_IN"]
+        if not split_tiers:
+            split_tiers = partner_tiers
+        if not all_in_tiers:
+            all_in_tiers = partner_tiers
+        split_tiers_by_partner[p_key] = split_tiers
+        total_units = billable_units_by_partner.get(p_key, 0)
+        all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
 
     # FOR_MONTH is required by the workflow logic.
     first_usage = usage_rows[0]
@@ -974,7 +1015,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     for_month_any = date(for_month_parsed.year, for_month_parsed.month, 1)
 
     # Pass 1: fee computation.
-    seen_partner_company: set[str] = set()
+    split_running_unit: Dict[str, int] = {}
     out_rows: List[Dict[str, Any]] = []
     partner_totals: Dict[str, float] = {}
 
@@ -1012,24 +1053,34 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             continue
 
         tiers = tiers_by_partner.get(p_key, [])
+        if not tiers:
+            row["fee_calc_status"] = "missing_tier"
+            row["row_type"] = "usage"
+            row["company_fee_units_charged"] = 0
+            row["user_fee_units_charged"] = 0
+            row["unit_price_er"] = 0.0
+            row["unit_price_iu"] = 0.0
+            row["er_fee"] = 0.0
+            row["iu_fee"] = 0.0
+            row["total_fee"] = 0.0
+            out_rows.append(row)
+            continue
+
+        mode = partner_tier_mode.get(p_key, "ALL_IN")
         selected_tier: Optional[Tier] = None
-
-        if looks_like_ach_override(row.get("CURRENT_ACH_SPEED")):
-            selected_tier = next((t for t in tiers if t.metric == "ACH_SPEED"), None)
-
-        if selected_tier is None:
-            row_users = num(row.get("TOTAL_INDIVIDUAL_USERS"))
-            selected_tier = next(
-                (
-                    t
-                    for t in tiers
-                    if t.metric == "IU_PER_ER" and t.start <= row_users <= t.end
-                ),
-                None,
+        metric_value_used: float = 0.0
+        if mode == "SPLIT":
+            split_running_unit[p_key] = split_running_unit.get(p_key, 0) + 1
+            metric_value_used = float(split_running_unit[p_key])
+            selected_tier = select_tier_for_value(
+                split_tiers_by_partner.get(p_key, tiers),
+                metric_value_used,
             )
-
-        if selected_tier is None:
-            selected_tier = pick_base_tier(p_key, tiers_by_partner, driver)
+        else:
+            metric_value_used = float(billable_units_by_partner.get(p_key, 0))
+            selected_tier = all_in_tier_by_partner.get(p_key)
+            if selected_tier is None:
+                selected_tier = select_tier_for_value(tiers, metric_value_used)
 
         if selected_tier is None:
             row["fee_calc_status"] = "missing_tier"
@@ -1044,36 +1095,20 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             out_rows.append(row)
             continue
 
-        partner_company_key = f"{p_key}|{c_key}"
-        first_for_company = partner_company_key not in seen_partner_company
-        if first_for_company:
-            seen_partner_company.add(partner_company_key)
-
         total_users = num(row.get("TOTAL_INDIVIDUAL_USERS"))
         chargeable_users = max(total_users - (1 if selected_tier.included else 0), 0.0)
 
-        row["company_fee_units_charged"] = 1 if first_for_company else 0
-        row["user_fee_units_charged"] = chargeable_users if first_for_company else 0.0
-        company_fee = selected_tier.company_fee if first_for_company else 0.0
-        user_fee = round2(chargeable_users * selected_tier.user_fee) if first_for_company else 0.0
+        row["company_fee_units_charged"] = 1
+        row["user_fee_units_charged"] = chargeable_users
+        company_fee = selected_tier.company_fee
+        user_fee = round2(chargeable_users * selected_tier.user_fee)
 
-        row["partner_tier_metric"] = selected_tier.metric
+        row["partner_tier_metric"] = selected_tier.tier_type
         row["tier_start"] = selected_tier.start
         row["tier_end"] = (
             selected_tier.end if math.isfinite(selected_tier.end) else ""
         )
-        if selected_tier.metric == "ACH_SPEED":
-            row["metric_value_used"] = 1
-        elif selected_tier.metric == "IU_PER_ER":
-            row["metric_value_used"] = total_users
-        else:
-            partner_driver = driver.get(p_key, {"ER": 0.0, "IU": 0.0})
-            if selected_tier.metric == "ER":
-                row["metric_value_used"] = partner_driver.get("ER", 0.0)
-            elif selected_tier.metric in {"IU", "FLAT"}:
-                row["metric_value_used"] = partner_driver.get("IU", 0.0)
-            else:
-                row["metric_value_used"] = ""
+        row["metric_value_used"] = metric_value_used
 
         row["included_users_in_company_fee"] = selected_tier.included
         row["unit_price_iu"] = selected_tier.user_fee
@@ -1084,8 +1119,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row["fee_calc_status"] = "ok"
         row["row_type"] = "usage"
 
-        if first_for_company:
-            partner_totals[p_key] = round2(partner_totals.get(p_key, 0.0) + row["total_fee"])
+        partner_totals[p_key] = round2(partner_totals.get(p_key, 0.0) + row["total_fee"])
 
         out_rows.append(row)
 
