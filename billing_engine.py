@@ -1353,7 +1353,20 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         )
     )
 
+    legacy_next_day_aliases = {
+        "NEXT_DAY_FEE_ER",
+        "NEXT_DAY_FEE_IU",
+        "NEXT_DAY_AMOUNT_ER",
+        "NEXT_DAY_AMOUNT_IU",
+        "UNIT_PRICE_NEXT_DAY_ER",
+        "UNIT_PRICE_NEXT_DAY_IU",
+        "NEXT_DAY_ER_FEE",
+        "NEXT_DAY_IU_FEE",
+    }
     for row in out_rows:
+        for alias in legacy_next_day_aliases:
+            if alias in row:
+                del row[alias]
         normalize_output_dates(row)
         row.setdefault("partner_minimum_applied", False)
         row.setdefault("partner_minimum_month_index", "")
