@@ -510,7 +510,7 @@ def git_commit_short() -> str:
         return ""
 
 
-def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> None:
+def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> pd.DataFrame:
     """Create NetSuite invoice import CSV using strict BRD schema and rules."""
     logger = logging.getLogger("billing_engine")
     required = {
@@ -721,10 +721,16 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     netsuite_df = pd.DataFrame(rows, columns=output_columns)
     netsuite_df.to_csv(output_path, index=False)
+    return netsuite_df
 
 
-def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) -> None:
-    """Create a two-tab master billing dashboard workbook."""
+def generate_master_billing_report(
+    df_usage: pd.DataFrame,
+    netsuite_df: pd.DataFrame,
+    input_metrics: dict,
+    output_path: Path,
+) -> None:
+    """Create a three-tab master billing dashboard workbook with audit controls."""
     data = df_usage.copy()
 
     if "PARTNER_NAME" not in data.columns:
@@ -737,6 +743,8 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
         data["ER_ID"] = ""
     if "ER_NAME" not in data.columns:
         data["ER_NAME"] = ""
+    if "TOTAL_INDIVIDUAL_USERS" not in data.columns:
+        data["TOTAL_INDIVIDUAL_USERS"] = 0
     if "user_fee_units_charged" not in data.columns:
         data["user_fee_units_charged"] = 0
     if "er_fee" not in data.columns:
@@ -749,6 +757,8 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
         data["next_day_iu_fee"] = 0
     if "total_fee" not in data.columns:
         data["total_fee"] = 0
+    if "fee_calc_status" not in data.columns:
+        data["fee_calc_status"] = ""
 
     data["_partner_name"] = data["PARTNER_NAME"].apply(key)
     fallback_partner_id = data["PARTNER_ID"].apply(key)
@@ -809,14 +819,99 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
 
     summary = summary.sort_values(by="Total Billed", ascending=False)
 
+    # -------------------------------------------------------------------------
+    # Audit & Controls
+    # -------------------------------------------------------------------------
+    input_row_count = int(input_metrics.get("row_count", 0))
+    input_total_users = float(input_metrics.get("total_users", 0.0))
+
+    output_usage_rows = int(len(usage))
+    output_total_users = float(
+        pd.to_numeric(usage["TOTAL_INDIVIDUAL_USERS"], errors="coerce").fillna(0).sum()
+    )
+
+    rows_variance = output_usage_rows - input_row_count
+    users_variance = round2(output_total_users - input_total_users)
+
+    master_total_billed = round2(pd.to_numeric(data["total_fee"], errors="coerce").fillna(0).sum())
+    netsuite_total = round2(
+        pd.to_numeric(netsuite_df.get("Amount", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+    netsuite_variance = round2(master_total_billed - netsuite_total)
+
+    usage_total_fee = pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0)
+    expected_usage_total = (
+        pd.to_numeric(usage["er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["iu_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["next_day_er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["next_day_iu_fee"], errors="coerce").fillna(0)
+    )
+    math_integrity_exceptions = int(((usage_total_fee - expected_usage_total).abs() > 0.01).sum())
+
+    exception_rows = int(
+        data["fee_calc_status"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+        .isin({"missing_tier", "bad_data"})
+        .sum()
+    )
+
+    audit_rows = [
+        {
+            "Control Check": "Completeness (Rows)",
+            "Input": input_row_count,
+            "Output": output_usage_rows,
+            "Variance": rows_variance,
+            "Status": "PASS" if rows_variance == 0 else "FAIL",
+        },
+        {
+            "Control Check": "Completeness (Users)",
+            "Input": round2(input_total_users),
+            "Output": round2(output_total_users),
+            "Variance": users_variance,
+            "Status": "PASS" if abs(users_variance) < 0.01 else "FAIL",
+        },
+        {
+            "Control Check": "NetSuite Tie-Out",
+            "Input": master_total_billed,
+            "Output": netsuite_total,
+            "Variance": netsuite_variance,
+            "Status": "PASS" if abs(netsuite_variance) < 0.01 else "FAIL",
+        },
+        {
+            "Control Check": "Math Integrity Exceptions",
+            "Input": 0,
+            "Output": math_integrity_exceptions,
+            "Variance": math_integrity_exceptions,
+            "Status": "PASS" if math_integrity_exceptions == 0 else "FAIL",
+        },
+        {
+            "Control Check": "Rows with Missing Tier / Bad Data",
+            "Input": 0,
+            "Output": exception_rows,
+            "Variance": exception_rows,
+            "Status": "PASS" if exception_rows == 0 else "REVIEW REQUIRED",
+        },
+    ]
+    audit_df = pd.DataFrame(
+        audit_rows,
+        columns=["Control Check", "Input", "Output", "Variance", "Status"],
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        # Sheet order matters: Audit first, then summary, then source.
+        audit_df.to_excel(writer, sheet_name="Audit & Controls", index=False)
         summary.to_excel(writer, sheet_name="Executive Summary")
         data.drop(columns=["_partner_name"], errors="ignore").to_excel(
             writer, sheet_name="Source Data", index=False
         )
 
         workbook = writer.book
+        ws_audit = writer.sheets["Audit & Controls"]
         ws_summary = writer.sheets["Executive Summary"]
         ws_source = writer.sheets["Source Data"]
 
@@ -832,8 +927,15 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
         fmt_currency = workbook.add_format({"num_format": "#,##0.00"})
         fmt_percent = workbook.add_format({"num_format": "0%"})
 
-        ws_summary.set_row(0, None, header_fmt)
+        # Audit sheet formatting.
+        ws_audit.set_row(0, None, header_fmt)
+        for col_idx, col_name in enumerate(audit_df.columns):
+            values = [str(v) for v in audit_df[col_name].fillna("").tolist()]
+            width = max([len(str(col_name))] + [len(v) for v in values]) + 2
+            ws_audit.set_column(col_idx, col_idx, max(15, min(30, width)))
 
+        # Executive summary formatting.
+        ws_summary.set_row(0, None, header_fmt)
         summary_formats = {
             1: fmt_count,      # Active End Users
             2: fmt_count,      # Billable Indiv. Users
@@ -858,6 +960,7 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
                 summary_formats.get(col_idx),
             )
 
+        ws_source.set_row(0, None, header_fmt)
         ws_source.freeze_panes(1, 0)
 
 
@@ -894,6 +997,13 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         by=["partner_name", "first_billable_activity_date"],
         ascending=[True, True],
     ).reset_index(drop=True)
+    input_row_count = len(usage_df)
+    input_total_users = 0.0
+    if "total_individual_users" in usage_df.columns:
+        input_total_users = float(
+            pd.to_numeric(usage_df["total_individual_users"], errors="coerce").fillna(0).sum()
+        )
+    input_metrics = {"row_count": input_row_count, "total_users": input_total_users}
     usage_source_columns = [str(col).upper() for col in usage_df.columns]
     usage_df["unit_price_next_day_er"] = 0.0
     usage_df["unit_price_next_day_iu"] = 0.0
@@ -1413,12 +1523,12 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     rules_snapshot_path = rules_snapshot_dir / rules_snapshot_name
     shutil.copy2(config_path, rules_snapshot_path)
 
-    history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
-    generate_master_billing_report(master_df, history_file_path)
-    logger.info("Wrote master billing report: %s", history_file_path)
-
-    generate_netsuite_import_file(master_df, netsuite_template_path)
+    netsuite_df = generate_netsuite_import_file(master_df, netsuite_template_path)
     logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
+
+    history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
+    generate_master_billing_report(master_df, netsuite_df, input_metrics, history_file_path)
+    logger.info("Wrote master billing report: %s", history_file_path)
 
     # Partner split files.
     if "PARTNER_NAME" not in master_df.columns:
