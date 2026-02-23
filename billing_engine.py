@@ -7,7 +7,7 @@ This script replicates the core fee logic from the supplied n8n workflow:
 3. Calculate ER and IU fees from tier rules with ACH override behavior.
 4. Apply partner minimum true-up adjustments when applicable.
 5. Write:
-   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Calculation.csv
+   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Billing_Report.xlsx
    - ./outputs/gep_netsuite_invoice_import.csv
    - ./outputs/gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
 """
@@ -15,14 +15,18 @@ This script replicates the core fee logic from the supplied n8n workflow:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -55,6 +59,9 @@ class Tier:
     company_fee: float
     user_fee: float
     included: int
+    tier_type: str = "ALL_IN"
+    unit_price_next_day_er: float = 0.0
+    unit_price_next_day_iu: float = 0.0
 
 
 DEFAULT_INPUTS_DIR = Path(
@@ -97,6 +104,7 @@ PREFERRED_OUTPUT_COLUMNS = [
     "CURRENT_ACH_SPEED",
     "IS_MRB",
     "MRB_BILLING_ANNIVERSARY",
+    "tier_type",
     "partner_tier_metric",
     "tier_start",
     "tier_end",
@@ -108,6 +116,10 @@ PREFERRED_OUTPUT_COLUMNS = [
     "er_fee",
     "unit_price_iu",
     "iu_fee",
+    "unit_price_next_day_er",
+    "unit_price_next_day_iu",
+    "next_day_er_fee",
+    "next_day_iu_fee",
     "total_fee",
     "fee_calc_status",
     "row_type",
@@ -471,7 +483,34 @@ def month_end(day: date) -> date:
     return first_next - timedelta(days=1)
 
 
-def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> None:
+def file_sha256(path: Path) -> str:
+    """Compute SHA256 hash for a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_commit_short() -> str:
+    """Best-effort git commit hash for traceability."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> pd.DataFrame:
     """Create NetSuite invoice import CSV using strict BRD schema and rules."""
     logger = logging.getLogger("billing_engine")
     required = {
@@ -682,10 +721,16 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     netsuite_df = pd.DataFrame(rows, columns=output_columns)
     netsuite_df.to_csv(output_path, index=False)
+    return netsuite_df
 
 
-def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) -> None:
-    """Create a two-tab master billing dashboard workbook."""
+def generate_master_billing_report(
+    df_usage: pd.DataFrame,
+    netsuite_df: pd.DataFrame,
+    input_metrics: dict,
+    output_path: Path,
+) -> None:
+    """Create a three-tab master billing dashboard workbook with audit controls."""
     data = df_usage.copy()
 
     if "PARTNER_NAME" not in data.columns:
@@ -698,10 +743,22 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
         data["ER_ID"] = ""
     if "ER_NAME" not in data.columns:
         data["ER_NAME"] = ""
+    if "TOTAL_INDIVIDUAL_USERS" not in data.columns:
+        data["TOTAL_INDIVIDUAL_USERS"] = 0
     if "user_fee_units_charged" not in data.columns:
         data["user_fee_units_charged"] = 0
+    if "er_fee" not in data.columns:
+        data["er_fee"] = 0
+    if "iu_fee" not in data.columns:
+        data["iu_fee"] = 0
+    if "next_day_er_fee" not in data.columns:
+        data["next_day_er_fee"] = 0
+    if "next_day_iu_fee" not in data.columns:
+        data["next_day_iu_fee"] = 0
     if "total_fee" not in data.columns:
         data["total_fee"] = 0
+    if "fee_calc_status" not in data.columns:
+        data["fee_calc_status"] = ""
 
     data["_partner_name"] = data["PARTNER_NAME"].apply(key)
     fallback_partner_id = data["PARTNER_ID"].apply(key)
@@ -723,7 +780,14 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
     usage_for_end_users = usage.loc[usage["_er_key"] != ""].copy()
 
     usage["_billable_users"] = pd.to_numeric(usage["user_fee_units_charged"], errors="coerce").fillna(0)
-    usage["_usage_revenue"] = pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0)
+    usage["_usage_revenue"] = (
+        pd.to_numeric(usage["er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["iu_fee"], errors="coerce").fillna(0)
+    )
+    usage["_next_day_fee_revenue"] = (
+        pd.to_numeric(usage["next_day_er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["next_day_iu_fee"], errors="coerce").fillna(0)
+    )
     minimums["_minimum_revenue"] = pd.to_numeric(minimums["total_fee"], errors="coerce").fillna(0)
 
     partners = sorted(set(data["_partner_name"].tolist()))
@@ -739,10 +803,15 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
     summary["Usage Revenue"] = (
         usage.groupby("_partner_name")["_usage_revenue"].sum().reindex(summary.index, fill_value=0.0)
     )
+    summary["Next Day Fee Revenue"] = (
+        usage.groupby("_partner_name")["_next_day_fee_revenue"].sum().reindex(summary.index, fill_value=0.0)
+    )
     summary["Minimum Revenue"] = (
         minimums.groupby("_partner_name")["_minimum_revenue"].sum().reindex(summary.index, fill_value=0.0)
     )
-    summary["Total Billed"] = summary["Usage Revenue"] + summary["Minimum Revenue"]
+    summary["Total Billed"] = (
+        summary["Usage Revenue"] + summary["Next Day Fee Revenue"] + summary["Minimum Revenue"]
+    )
     summary["% from Minimums"] = summary.apply(
         lambda r: (r["Minimum Revenue"] / r["Total Billed"]) if r["Total Billed"] else 0,
         axis=1,
@@ -750,14 +819,99 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
 
     summary = summary.sort_values(by="Total Billed", ascending=False)
 
+    # -------------------------------------------------------------------------
+    # Audit & Controls
+    # -------------------------------------------------------------------------
+    input_row_count = int(input_metrics.get("row_count", 0))
+    input_total_users = float(input_metrics.get("total_users", 0.0))
+
+    output_usage_rows = int(len(usage))
+    output_total_users = float(
+        pd.to_numeric(usage["TOTAL_INDIVIDUAL_USERS"], errors="coerce").fillna(0).sum()
+    )
+
+    rows_variance = output_usage_rows - input_row_count
+    users_variance = round2(output_total_users - input_total_users)
+
+    master_total_billed = round2(pd.to_numeric(data["total_fee"], errors="coerce").fillna(0).sum())
+    netsuite_total = round2(
+        pd.to_numeric(netsuite_df.get("Amount", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+    netsuite_variance = round2(master_total_billed - netsuite_total)
+
+    usage_total_fee = pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0)
+    expected_usage_total = (
+        pd.to_numeric(usage["er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["iu_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["next_day_er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["next_day_iu_fee"], errors="coerce").fillna(0)
+    )
+    math_integrity_exceptions = int(((usage_total_fee - expected_usage_total).abs() > 0.01).sum())
+
+    exception_rows = int(
+        data["fee_calc_status"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+        .isin({"missing_tier", "bad_data"})
+        .sum()
+    )
+
+    audit_rows = [
+        {
+            "Control Check": "Completeness (Rows)",
+            "Input": input_row_count,
+            "Output": output_usage_rows,
+            "Variance": rows_variance,
+            "Status": "PASS" if rows_variance == 0 else "FAIL",
+        },
+        {
+            "Control Check": "Completeness (Users)",
+            "Input": round2(input_total_users),
+            "Output": round2(output_total_users),
+            "Variance": users_variance,
+            "Status": "PASS" if abs(users_variance) < 0.01 else "FAIL",
+        },
+        {
+            "Control Check": "NetSuite Tie-Out",
+            "Input": master_total_billed,
+            "Output": netsuite_total,
+            "Variance": netsuite_variance,
+            "Status": "PASS" if abs(netsuite_variance) < 0.01 else "FAIL",
+        },
+        {
+            "Control Check": "Math Integrity Exceptions",
+            "Input": 0,
+            "Output": math_integrity_exceptions,
+            "Variance": math_integrity_exceptions,
+            "Status": "PASS" if math_integrity_exceptions == 0 else "FAIL",
+        },
+        {
+            "Control Check": "Rows with Missing Tier / Bad Data",
+            "Input": 0,
+            "Output": exception_rows,
+            "Variance": exception_rows,
+            "Status": "PASS" if exception_rows == 0 else "REVIEW REQUIRED",
+        },
+    ]
+    audit_df = pd.DataFrame(
+        audit_rows,
+        columns=["Control Check", "Input", "Output", "Variance", "Status"],
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        # Sheet order matters: Audit first, then summary, then source.
+        audit_df.to_excel(writer, sheet_name="Audit & Controls", index=False)
         summary.to_excel(writer, sheet_name="Executive Summary")
         data.drop(columns=["_partner_name"], errors="ignore").to_excel(
             writer, sheet_name="Source Data", index=False
         )
 
         workbook = writer.book
+        ws_audit = writer.sheets["Audit & Controls"]
         ws_summary = writer.sheets["Executive Summary"]
         ws_source = writer.sheets["Source Data"]
 
@@ -773,15 +927,23 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
         fmt_currency = workbook.add_format({"num_format": "#,##0.00"})
         fmt_percent = workbook.add_format({"num_format": "0%"})
 
-        ws_summary.set_row(0, None, header_fmt)
+        # Audit sheet formatting.
+        ws_audit.set_row(0, None, header_fmt)
+        for col_idx, col_name in enumerate(audit_df.columns):
+            values = [str(v) for v in audit_df[col_name].fillna("").tolist()]
+            width = max([len(str(col_name))] + [len(v) for v in values]) + 2
+            ws_audit.set_column(col_idx, col_idx, max(15, min(30, width)))
 
+        # Executive summary formatting.
+        ws_summary.set_row(0, None, header_fmt)
         summary_formats = {
             1: fmt_count,      # Active End Users
             2: fmt_count,      # Billable Indiv. Users
             3: fmt_currency,   # Usage Revenue
-            4: fmt_currency,   # Minimum Revenue
-            5: fmt_currency,   # Total Billed
-            6: fmt_percent,    # % from Minimums
+            4: fmt_currency,   # Next Day Fee Revenue
+            5: fmt_currency,   # Minimum Revenue
+            6: fmt_currency,   # Total Billed
+            7: fmt_percent,    # % from Minimums
         }
 
         summary_index_strings = [str(v) for v in summary.index.tolist()]
@@ -798,24 +960,73 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
                 summary_formats.get(col_idx),
             )
 
+        ws_source.set_row(0, None, header_fmt)
         ws_source.freeze_panes(1, 0)
 
 
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
+    run_started_at = datetime.now(timezone.utc).replace(microsecond=0)
+    run_id = run_started_at.strftime("%Y%m%dT%H%M%SZ")
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
     config_path = inputs_dir / config_filename
+    if not config_path.exists():
+        raise BillingEngineError(f"Config workbook not found: {config_path}")
+    usage_file_hash = file_sha256(usage_file)
+    rules_file_hash = file_sha256(config_path)
+    rules_last_modified = datetime.fromtimestamp(
+        config_path.stat().st_mtime, tz=timezone.utc
+    ).replace(microsecond=0)
 
     logger.info("Loading usage CSV...")
     usage_df = pd.read_csv(usage_file, dtype=object)
     usage_df = normalize_dataframe_columns(usage_df)
     if usage_df.empty:
         raise BillingEngineError(f"Usage file is empty: {usage_file}")
+    if "partner_name" not in usage_df.columns:
+        usage_df["partner_name"] = ""
+    if "first_billable_activity_date" not in usage_df.columns:
+        usage_df["first_billable_activity_date"] = pd.NaT
+    usage_df["first_billable_activity_date"] = usage_df[
+        "first_billable_activity_date"
+    ].apply(parse_date)
+    usage_df["first_billable_activity_date"] = pd.to_datetime(
+        usage_df["first_billable_activity_date"], errors="coerce"
+    )
+    usage_df = usage_df.sort_values(
+        by=["partner_name", "first_billable_activity_date"],
+        ascending=[True, True],
+    ).reset_index(drop=True)
+    input_row_count = len(usage_df)
+    input_total_users = 0.0
+    if "total_individual_users" in usage_df.columns:
+        input_total_users = float(
+            pd.to_numeric(usage_df["total_individual_users"], errors="coerce").fillna(0).sum()
+        )
+    input_metrics = {"row_count": input_row_count, "total_users": input_total_users}
     usage_source_columns = [str(col).upper() for col in usage_df.columns]
+    usage_df["unit_price_next_day_er"] = 0.0
+    usage_df["unit_price_next_day_iu"] = 0.0
+    usage_df["next_day_er_fee"] = 0.0
+    usage_df["next_day_iu_fee"] = 0.0
 
     logger.info("Loading rules workbook...")
     sheets = load_rules_workbook(config_path)
     pricing_df = sheets[SHEET_PRICING]
+    if "next_day_fee_er" in pricing_df.columns and "unit_price_next_day_er" not in pricing_df.columns:
+        pricing_df["unit_price_next_day_er"] = pricing_df["next_day_fee_er"]
+    if "next_day_fee_iu" in pricing_df.columns and "unit_price_next_day_iu" not in pricing_df.columns:
+        pricing_df["unit_price_next_day_iu"] = pricing_df["next_day_fee_iu"]
+    if "unit_price_next_day_er" not in pricing_df.columns:
+        pricing_df["unit_price_next_day_er"] = 0.0
+    if "unit_price_next_day_iu" not in pricing_df.columns:
+        pricing_df["unit_price_next_day_iu"] = 0.0
+    pricing_df["unit_price_next_day_er"] = pd.to_numeric(
+        pricing_df["unit_price_next_day_er"], errors="coerce"
+    ).fillna(0.0)
+    pricing_df["unit_price_next_day_iu"] = pd.to_numeric(
+        pricing_df["unit_price_next_day_iu"], errors="coerce"
+    ).fillna(0.0)
     minimums_df = sheets[SHEET_MINIMUMS]
     config_df = sheets[SHEET_CONFIG]
     mapping_df = sheets[SHEET_MAPPING]
@@ -879,7 +1090,13 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     for p_key in min_sched_by_partner:
         min_sched_by_partner[p_key].sort(key=lambda r: r["start"])
 
-    # Build tier rules by partner.
+    # Build tier rules by partner and normalize tier mode.
+    if "tier_type" not in pricing_df.columns:
+        pricing_df["tier_type"] = "ALL_IN"
+    pricing_df["tier_type"] = pricing_df["tier_type"].fillna("").astype(str).str.strip()
+    pricing_df.loc[pricing_df["tier_type"] == "", "tier_type"] = "ALL_IN"
+    pricing_df["tier_type"] = pricing_df["tier_type"].str.upper()
+
     tiers_by_partner: Dict[str, List[Tier]] = {}
     for row in pricing_df.to_dict(orient="records"):
         p_key = pricing_partner_key(row)
@@ -890,6 +1107,9 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             tier_end = float("inf")
         else:
             tier_end = num(end_value)
+        tier_type_value = key(row.get("tier_type")).upper() or "ALL_IN"
+        if tier_type_value not in {"ALL_IN", "SPLIT"}:
+            tier_type_value = "ALL_IN"
         tier = Tier(
             metric=metric_norm(value_from_aliases(row, ["tier_metric", "metric"])),
             start=num(value_from_aliases(row, ["tierstart", "tier_start", "start"])),
@@ -899,31 +1119,85 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             included=1
             if num(value_from_aliases(row, ["include_iu", "included_users_in_company_fee", "included"])) > 0
             else 0,
+            tier_type=tier_type_value,
+            unit_price_next_day_er=num(value_from_aliases(row, ["unit_price_next_day_er", "next_day_fee_er"])),
+            unit_price_next_day_iu=num(value_from_aliases(row, ["unit_price_next_day_iu", "next_day_fee_iu"])),
         )
         tiers_by_partner.setdefault(p_key, []).append(tier)
     for p_key in tiers_by_partner:
         tiers_by_partner[p_key].sort(key=lambda t: t.start)
 
-    # Aggregate partner drivers from usage (ER count and IU total).
-    agg_by_partner: Dict[str, Dict[str, Any]] = {}
-    for row in usage_rows:
-        p_key = usage_partner_key(row)
-        c_key = usage_company_key(row)
-        if not p_key or not c_key:
-            continue
-        users = num(row.get("TOTAL_INDIVIDUAL_USERS"))
-        agg_entry = agg_by_partner.setdefault(
-            p_key, {"companies": set(), "users_by_company": {}}
-        )
-        agg_entry["companies"].add(c_key)
-        previous = agg_entry["users_by_company"].get(c_key, 0.0)
-        agg_entry["users_by_company"][c_key] = max(users, previous)
+    partner_tier_mode: Dict[str, str] = {}
+    partner_metric_by_partner: Dict[str, str] = {}
+    for p_key, partner_tiers in tiers_by_partner.items():
+        tier_types = {tier.tier_type for tier in partner_tiers}
+        if len(tier_types) > 1:
+            logger.warning(
+                "Partner '%s' has mixed tier_type values %s. SPLIT takes precedence.",
+                p_key,
+                sorted(tier_types),
+            )
+        partner_tier_mode[p_key] = "SPLIT" if "SPLIT" in tier_types else "ALL_IN"
 
-    driver: Dict[str, Dict[str, float]] = {}
-    for p_key, agg_entry in agg_by_partner.items():
-        er_count = float(len(agg_entry["companies"]))
-        iu_sum = float(sum(num(v) for v in agg_entry["users_by_company"].values()))
-        driver[p_key] = {"ER": er_count, "IU": iu_sum}
+        metric_candidates = [tier.metric for tier in partner_tiers if tier.metric in {"IU", "ER", "FLAT"}]
+        if not metric_candidates:
+            partner_metric_by_partner[p_key] = "FLAT"
+        else:
+            chosen_metric = metric_candidates[0]
+            if len(set(metric_candidates)) > 1:
+                logger.warning(
+                    "Partner '%s' has mixed tier metrics %s. Using '%s'.",
+                    p_key,
+                    sorted(set(metric_candidates)),
+                    chosen_metric,
+                )
+            partner_metric_by_partner[p_key] = chosen_metric
+
+    def select_tier_for_value(tiers: List[Tier], value: float) -> Optional[Tier]:
+        if not tiers:
+            return None
+        matched = [tier for tier in tiers if tier.start <= value <= tier.end]
+        if matched:
+            return max(matched, key=lambda tier: tier.start)
+        if value < min(tier.start for tier in tiers):
+            return min(tiers, key=lambda tier: tier.start)
+        return max(tiers, key=lambda tier: tier.start)
+
+    all_in_tier_by_partner: Dict[str, Optional[Tier]] = {}
+    split_tiers_by_partner: Dict[str, List[Tier]] = {}
+    total_metric_units_by_partner: Dict[str, float] = {}
+    seen_er_for_total: Dict[str, set[str]] = {}
+    for p_key, partner_tiers in tiers_by_partner.items():
+        metric = partner_metric_by_partner.get(p_key, "FLAT")
+        metric_tiers = [tier for tier in partner_tiers if tier.metric == metric]
+        if not metric_tiers:
+            metric_tiers = partner_tiers
+
+        split_tiers = [tier for tier in metric_tiers if tier.tier_type == "SPLIT"]
+        all_in_tiers = [tier for tier in metric_tiers if tier.tier_type == "ALL_IN"]
+        if not split_tiers:
+            split_tiers = metric_tiers
+        if not all_in_tiers:
+            all_in_tiers = metric_tiers
+        split_tiers_by_partner[p_key] = split_tiers
+        total_metric_units_by_partner[p_key] = 0.0
+        seen_er_for_total[p_key] = set()
+        total_units = 0.0
+        for usage_row in usage_rows:
+            row_partner = usage_partner_key(usage_row)
+            row_company = usage_company_key(usage_row)
+            if row_partner != p_key or not row_company:
+                continue
+            if metric == "IU":
+                total_units += max(num(usage_row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+            elif metric == "ER":
+                if row_company not in seen_er_for_total[p_key]:
+                    seen_er_for_total[p_key].add(row_company)
+                    total_units += 1.0
+            else:  # FLAT
+                total_units += 1.0
+        total_metric_units_by_partner[p_key] = total_units
+        all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
 
     # FOR_MONTH is required by the workflow logic.
     first_usage = usage_rows[0]
@@ -938,7 +1212,8 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     for_month_any = date(for_month_parsed.year, for_month_parsed.month, 1)
 
     # Pass 1: fee computation.
-    seen_partner_company: set[str] = set()
+    split_running_unit: Dict[str, float] = {}
+    split_seen_er: Dict[str, set[str]] = {}
     out_rows: List[Dict[str, Any]] = []
     partner_totals: Dict[str, float] = {}
 
@@ -957,6 +1232,20 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
 
         if "company_uuid" in row and "COMPANY_UUID" not in row:
             row["COMPANY_UUID"] = row.pop("company_uuid")
+        for raw_col, norm_col in (
+            ("NEXT_DAY_FEE_ER", "unit_price_next_day_er"),
+            ("NEXT_DAY_FEE_IU", "unit_price_next_day_iu"),
+            ("NEXT_DAY_AMOUNT_ER", "next_day_er_fee"),
+            ("NEXT_DAY_AMOUNT_IU", "next_day_iu_fee"),
+            ("UNIT_PRICE_NEXT_DAY_ER", "unit_price_next_day_er"),
+            ("UNIT_PRICE_NEXT_DAY_IU", "unit_price_next_day_iu"),
+            ("NEXT_DAY_ER_FEE", "next_day_er_fee"),
+            ("NEXT_DAY_IU_FEE", "next_day_iu_fee"),
+        ):
+            if raw_col in row and norm_col not in row:
+                row[norm_col] = num(row.pop(raw_col))
+            else:
+                row.setdefault(norm_col, 0.0)
 
         row["netsuite_customer_name"] = lookup_netsuite_name(
             partner_id_raw, partner_name_raw, p_key
@@ -976,24 +1265,48 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             continue
 
         tiers = tiers_by_partner.get(p_key, [])
+        if not tiers:
+            row["fee_calc_status"] = "missing_tier"
+            row["row_type"] = "usage"
+            row["company_fee_units_charged"] = 0
+            row["user_fee_units_charged"] = 0
+            row["unit_price_er"] = 0.0
+            row["unit_price_iu"] = 0.0
+            row["er_fee"] = 0.0
+            row["iu_fee"] = 0.0
+            row["total_fee"] = 0.0
+            out_rows.append(row)
+            continue
+
+        mode = partner_tier_mode.get(p_key, "ALL_IN")
+        metric = partner_metric_by_partner.get(p_key, "FLAT")
         selected_tier: Optional[Tier] = None
-
-        if looks_like_ach_override(row.get("CURRENT_ACH_SPEED")):
-            selected_tier = next((t for t in tiers if t.metric == "ACH_SPEED"), None)
-
-        if selected_tier is None:
-            row_users = num(row.get("TOTAL_INDIVIDUAL_USERS"))
-            selected_tier = next(
-                (
-                    t
-                    for t in tiers
-                    if t.metric == "IU_PER_ER" and t.start <= row_users <= t.end
-                ),
-                None,
+        metric_value_used: float = 0.0
+        row["tier_type"] = mode
+        if mode == "SPLIT":
+            if metric == "IU":
+                increment = max(num(row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+            elif metric == "ER":
+                seen = split_seen_er.setdefault(p_key, set())
+                increment = 0.0
+                if c_key not in seen:
+                    seen.add(c_key)
+                    increment = 1.0
+            else:  # FLAT
+                increment = 1.0
+            split_running_unit[p_key] = split_running_unit.get(p_key, 0.0) + increment
+            metric_value_used = float(split_running_unit[p_key])
+            tier_value = metric_value_used if metric_value_used > 0 else 1.0
+            selected_tier = select_tier_for_value(
+                split_tiers_by_partner.get(p_key, tiers),
+                tier_value,
             )
-
-        if selected_tier is None:
-            selected_tier = pick_base_tier(p_key, tiers_by_partner, driver)
+        else:
+            metric_value_used = float(total_metric_units_by_partner.get(p_key, 0.0))
+            tier_value = metric_value_used if metric_value_used > 0 else 1.0
+            selected_tier = all_in_tier_by_partner.get(p_key)
+            if selected_tier is None:
+                selected_tier = select_tier_for_value(tiers, tier_value)
 
         if selected_tier is None:
             row["fee_calc_status"] = "missing_tier"
@@ -1008,48 +1321,50 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             out_rows.append(row)
             continue
 
-        partner_company_key = f"{p_key}|{c_key}"
-        first_for_company = partner_company_key not in seen_partner_company
-        if first_for_company:
-            seen_partner_company.add(partner_company_key)
-
         total_users = num(row.get("TOTAL_INDIVIDUAL_USERS"))
         chargeable_users = max(total_users - (1 if selected_tier.included else 0), 0.0)
 
-        row["company_fee_units_charged"] = 1 if first_for_company else 0
-        row["user_fee_units_charged"] = chargeable_users if first_for_company else 0.0
-        company_fee = selected_tier.company_fee if first_for_company else 0.0
-        user_fee = round2(chargeable_users * selected_tier.user_fee) if first_for_company else 0.0
+        row["company_fee_units_charged"] = 1
+        row["user_fee_units_charged"] = chargeable_users
+        company_fee = selected_tier.company_fee
+        user_fee = round2(chargeable_users * selected_tier.user_fee)
 
         row["partner_tier_metric"] = selected_tier.metric
         row["tier_start"] = selected_tier.start
         row["tier_end"] = (
             selected_tier.end if math.isfinite(selected_tier.end) else ""
         )
-        if selected_tier.metric == "ACH_SPEED":
-            row["metric_value_used"] = 1
-        elif selected_tier.metric == "IU_PER_ER":
-            row["metric_value_used"] = total_users
-        else:
-            partner_driver = driver.get(p_key, {"ER": 0.0, "IU": 0.0})
-            if selected_tier.metric == "ER":
-                row["metric_value_used"] = partner_driver.get("ER", 0.0)
-            elif selected_tier.metric in {"IU", "FLAT"}:
-                row["metric_value_used"] = partner_driver.get("IU", 0.0)
-            else:
-                row["metric_value_used"] = ""
+        row["metric_value_used"] = metric_value_used
 
         row["included_users_in_company_fee"] = selected_tier.included
         row["unit_price_iu"] = selected_tier.user_fee
         row["unit_price_er"] = selected_tier.company_fee
         row["er_fee"] = round2(company_fee)
         row["iu_fee"] = round2(user_fee)
-        row["total_fee"] = round2(row["er_fee"] + row["iu_fee"])
+
+        if looks_like_ach_override(row.get("CURRENT_ACH_SPEED")):
+            row["unit_price_next_day_er"] = round2(selected_tier.unit_price_next_day_er)
+            row["unit_price_next_day_iu"] = round2(selected_tier.unit_price_next_day_iu)
+            row["next_day_er_fee"] = round2(row["unit_price_next_day_er"])
+            row["next_day_iu_fee"] = round2(
+                row["unit_price_next_day_iu"] * num(row.get("user_fee_units_charged"))
+            )
+        else:
+            row["unit_price_next_day_er"] = 0.0
+            row["unit_price_next_day_iu"] = 0.0
+            row["next_day_er_fee"] = 0.0
+            row["next_day_iu_fee"] = 0.0
+
+        row["total_fee"] = round2(
+            row["er_fee"]
+            + row["iu_fee"]
+            + row["next_day_er_fee"]
+            + row["next_day_iu_fee"]
+        )
         row["fee_calc_status"] = "ok"
         row["row_type"] = "usage"
 
-        if first_for_company:
-            partner_totals[p_key] = round2(partner_totals.get(p_key, 0.0) + row["total_fee"])
+        partner_totals[p_key] = round2(partner_totals.get(p_key, 0.0) + row["total_fee"])
 
         out_rows.append(row)
 
@@ -1115,6 +1430,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 "netsuite_customer_name": ns_name,
                 "unit_price_iu": 0.0,
                 "unit_price_er": 0.0,
+                "tier_type": partner_tier_mode.get(p_key, "ALL_IN"),
                 "partner_tier_metric": "MIN",
                 "tier_start": now_idx,
                 "tier_end": now_idx,
@@ -1124,6 +1440,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 "user_fee_units_charged": 0,
                 "er_fee": 0.0,
                 "iu_fee": shortfall,
+                "unit_price_next_day_er": 0.0,
+                "unit_price_next_day_iu": 0.0,
+                "next_day_er_fee": 0.0,
+                "next_day_iu_fee": 0.0,
                 "total_fee": shortfall,
                 "fee_calc_status": "min_trueup",
                 "row_type": "min_trueup",
@@ -1143,12 +1463,26 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         )
     )
 
+    legacy_next_day_aliases = {
+        "NEXT_DAY_FEE_ER",
+        "NEXT_DAY_FEE_IU",
+        "NEXT_DAY_AMOUNT_ER",
+        "NEXT_DAY_AMOUNT_IU",
+        "UNIT_PRICE_NEXT_DAY_ER",
+        "UNIT_PRICE_NEXT_DAY_IU",
+        "NEXT_DAY_ER_FEE",
+        "NEXT_DAY_IU_FEE",
+    }
     for row in out_rows:
+        for alias in legacy_next_day_aliases:
+            if alias in row:
+                del row[alias]
         normalize_output_dates(row)
         row.setdefault("partner_minimum_applied", False)
         row.setdefault("partner_minimum_month_index", "")
         row.setdefault("partner_minimum_amount", "")
         row.setdefault("partner_minimum_shortfall", "")
+        row.setdefault("tier_type", "")
         row.setdefault("partner_tier_metric", "")
         row.setdefault("tier_start", "")
         row.setdefault("tier_end", "")
@@ -1160,6 +1494,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row.setdefault("unit_price_iu", "")
         row.setdefault("er_fee", "")
         row.setdefault("iu_fee", "")
+        row.setdefault("unit_price_next_day_er", 0.0)
+        row.setdefault("unit_price_next_day_iu", 0.0)
+        row.setdefault("next_day_er_fee", 0.0)
+        row.setdefault("next_day_iu_fee", 0.0)
         row.setdefault("total_fee", "")
         row.setdefault("fee_calc_status", "")
         row.setdefault("row_type", "usage")
@@ -1170,6 +1508,8 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     partner_dir.mkdir(parents=True, exist_ok=True)
     history_path = outputs_dir / "gep_billing_log"
     history_path.mkdir(parents=True, exist_ok=True)
+    rules_snapshot_dir = history_path / "rules_snapshots"
+    rules_snapshot_dir.mkdir(parents=True, exist_ok=True)
     netsuite_template_path = outputs_dir / "gep_netsuite_invoice_import.csv"
     logger.debug("NetSuite upload template path: %s", netsuite_template_path)
 
@@ -1177,26 +1517,24 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     master_df = pd.DataFrame(out_rows, columns=output_columns)
 
     billing_period = f"{for_month_any.year:04d}.{for_month_any.month:02d}"
-    history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
-    generate_master_billing_report(master_df, history_file_path)
-    logger.info("Wrote master billing report: %s", history_file_path)
+    rules_snapshot_name = (
+        f"rules_snapshot_{billing_period.replace('.', '-')}_{run_id}{config_path.suffix or '.xlsx'}"
+    )
+    rules_snapshot_path = rules_snapshot_dir / rules_snapshot_name
+    shutil.copy2(config_path, rules_snapshot_path)
 
-    generate_netsuite_import_file(master_df, netsuite_template_path)
+    netsuite_df = generate_netsuite_import_file(master_df, netsuite_template_path)
     logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
+
+    history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
+    generate_master_billing_report(master_df, netsuite_df, input_metrics, history_file_path)
+    logger.info("Wrote master billing report: %s", history_file_path)
 
     # Partner split files.
     if "PARTNER_NAME" not in master_df.columns:
         raise BillingEngineError("PARTNER_NAME column missing from output data.")
     if "FOR_MONTH" not in master_df.columns:
         raise BillingEngineError("FOR_MONTH column missing from output data.")
-
-    detail_columns: List[str] = []
-    for col in usage_source_columns + PARTNER_DETAIL_CALC_COLUMNS:
-        if col not in detail_columns:
-            detail_columns.append(col)
-    for col in detail_columns:
-        if col not in master_df.columns:
-            master_df[col] = ""
 
     for partner_name, group in master_df.groupby("PARTNER_NAME", dropna=False):
         group_partner_name = key(partner_name)
@@ -1217,13 +1555,63 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         file_name = f"{partner_display} - {year_month}.xlsx"
         file_path = partner_folder_path / file_name
 
-        detail_df = group.loc[:, detail_columns].copy()
+        has_next_day_fees = False
+        if "next_day_er_fee" in group.columns and "next_day_iu_fee" in group.columns:
+            next_day_total = (
+                pd.to_numeric(group["next_day_er_fee"], errors="coerce").fillna(0).sum()
+                + pd.to_numeric(group["next_day_iu_fee"], errors="coerce").fillna(0).sum()
+            )
+            has_next_day_fees = next_day_total > 0
+
+        has_mrb = False
+        if "IS_MRB" in group.columns:
+            mrb_values = (
+                group["IS_MRB"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            has_mrb = mrb_values.isin({"yes", "true", "1"}).any()
+
+        base_columns: List[str] = []
+        for col in usage_source_columns:
+            if col == "CURRENT_ACH_SPEED":
+                if has_next_day_fees:
+                    base_columns.append(col)
+                continue
+            if col in {"IS_MRB", "MRB_BILLING_ANNIVERSARY"}:
+                if has_mrb:
+                    base_columns.append(col)
+                continue
+            base_columns.append(col)
+
+        detail_columns: List[str] = []
+        for col in base_columns + PARTNER_DETAIL_CALC_COLUMNS:
+            if col not in detail_columns:
+                detail_columns.append(col)
+        if has_next_day_fees:
+            for col in ["next_day_er_fee", "unit_price_next_day_iu", "next_day_iu_fee"]:
+                if col not in detail_columns:
+                    detail_columns.append(col)
+        if "total_fee" in detail_columns:
+            detail_columns = [col for col in detail_columns if col != "total_fee"] + ["total_fee"]
+
+        detail_df = group.copy()
+        for col in detail_columns:
+            if col not in detail_df.columns:
+                detail_df[col] = ""
+        detail_df = detail_df.loc[:, detail_columns]
 
         # Normalize known numeric output columns before applying Excel formats.
         for col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
             if col_name in detail_df.columns:
                 detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
-        for col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+
+        financial_columns = set(PARTNER_DETAIL_FINANCIAL_COLUMNS)
+        if has_next_day_fees:
+            financial_columns.update({"unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"})
+        for col_name in financial_columns:
             if col_name in detail_df.columns:
                 detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
 
@@ -1240,11 +1628,40 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 col_fmt = None
                 if col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
                     col_fmt = fmt_int
-                elif col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+                elif col_name in financial_columns:
                     col_fmt = fmt_money
                 worksheet.set_column(col_idx, col_idx, 18, col_fmt)
 
         logger.info("Wrote partner detail file: %s", file_path)
+
+    manifest = {
+        "run_id": run_id,
+        "run_timestamp_utc": run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "billing_period": billing_period,
+        "engine_git_commit": git_commit_short(),
+        "usage_file": {
+            "path": str(usage_file),
+            "name": usage_file.name,
+            "sha256": usage_file_hash,
+        },
+        "rules_file": {
+            "path": str(config_path),
+            "name": config_path.name,
+            "last_modified_utc": rules_last_modified.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "sha256": rules_file_hash,
+            "snapshot_path": str(rules_snapshot_path),
+        },
+        "outputs": {
+            "master_billing_report": str(history_file_path),
+            "netsuite_import_file": str(netsuite_template_path),
+            "partner_details_folder": str(partner_dir),
+        },
+        "status": "completed",
+    }
+    manifest_path = history_path / f"{billing_period}_run_manifest_{run_id}.json"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    logger.info("Wrote run manifest: %s", manifest_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
