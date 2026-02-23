@@ -7,7 +7,8 @@ This script replicates the core fee logic from the supplied n8n workflow:
 3. Calculate ER and IU fees from tier rules with ACH override behavior.
 4. Apply partner minimum true-up adjustments when applicable.
 5. Write:
-   - ./outputs/NetSuite_Import_Staging.csv
+   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Calculation.csv
+   - ./outputs/gep_netsuite_invoice_import.csv
    - ./outputs/gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
 """
 
@@ -30,6 +31,13 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard for runtime setup
     raise SystemExit(
         "Missing dependency: pandas/openpyxl. Install with: python3 -m pip install pandas openpyxl"
+    ) from exc
+
+try:
+    import xlsxwriter  # noqa: F401
+except ImportError as exc:  # pragma: no cover - import guard for runtime setup
+    raise SystemExit(
+        "Missing dependency: xlsxwriter. Install with: python3 -m pip install xlsxwriter"
     ) from exc
 
 
@@ -448,6 +456,351 @@ def order_columns(rows: List[Dict[str, Any]]) -> List[str]:
     return ordered + extras
 
 
+def sanitize_partner_id_for_invoice(value: Any) -> str:
+    """Normalize partner id token used in invoice external ids."""
+    sanitized = re.sub(r"[^A-Za-z0-9]", "", key(value))
+    return sanitized or "UNKNOWN"
+
+
+def month_end(day: date) -> date:
+    """Return last calendar day for the month containing the provided date."""
+    if day.month == 12:
+        first_next = date(day.year + 1, 1, 1)
+    else:
+        first_next = date(day.year, day.month + 1, 1)
+    return first_next - timedelta(days=1)
+
+
+def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> None:
+    """Create NetSuite invoice import CSV using strict BRD schema and rules."""
+    logger = logging.getLogger("billing_engine")
+    required = {
+        "netsuite_customer_name",
+        "FOR_MONTH",
+        "PARTNER_ID",
+        "row_type",
+        "ER_ID",
+        "ER_NAME",
+        "er_fee",
+        "iu_fee",
+        "total_fee",
+        "user_fee_units_charged",
+        "unit_price_er",
+        "unit_price_iu",
+    }
+    missing = sorted(col for col in required if col not in df_usage.columns)
+    if missing:
+        raise BillingEngineError(
+            f"Cannot generate NetSuite import: missing required columns {missing}"
+        )
+
+    output_columns = [
+        "Customer",
+        "Invoice External ID",
+        "Memo",
+        "Transaction Date",
+        "Item",
+        "Description",
+        "Quantity",
+        "Unit Price",
+        "Amount",
+        "Product",
+    ]
+
+    # Customer-level unit price audit warnings.
+    usage_mask_all = df_usage["row_type"].fillna("").astype(str).str.lower() == "usage"
+    usage_all = df_usage.loc[usage_mask_all].copy()
+    for customer_name, cust_group in usage_all.groupby("netsuite_customer_name", dropna=False):
+        er_prices = sorted(
+            set(
+                float(v)
+                for v in pd.to_numeric(cust_group["unit_price_er"], errors="coerce")
+                .dropna()
+                .tolist()
+            )
+        )
+        iu_prices = sorted(
+            set(
+                float(v)
+                for v in pd.to_numeric(cust_group["unit_price_iu"], errors="coerce")
+                .dropna()
+                .tolist()
+            )
+        )
+        if len(er_prices) > 1:
+            logger.warning(
+                "Unit price check warning for customer '%s': multiple unit_price_er values %s",
+                key(customer_name),
+                er_prices,
+            )
+        if len(iu_prices) > 1:
+            logger.warning(
+                "Unit price check warning for customer '%s': multiple unit_price_iu values %s",
+                key(customer_name),
+                iu_prices,
+            )
+
+    rows: List[Dict[str, Any]] = []
+    grouped = df_usage.groupby(["netsuite_customer_name", "FOR_MONTH", "PARTNER_ID"], dropna=False)
+    for (customer_name, for_month, partner_id_raw), group in grouped:
+        parsed_month = parse_date(for_month)
+        if parsed_month is None:
+            logger.warning(
+                "Skipping NetSuite invoice group due to invalid FOR_MONTH. customer='%s', partner_id='%s', for_month='%s'",
+                key(customer_name),
+                key(partner_id_raw),
+                key(for_month),
+            )
+            continue
+
+        billing_month = date(parsed_month.year, parsed_month.month, 1)
+        transaction_date = month_end(billing_month)
+        yyyymm = f"{billing_month.year:04d}{billing_month.month:02d}"
+        memo = billing_month.strftime("%B %Y Invoice")
+
+        partner_token = sanitize_partner_id_for_invoice(partner_id_raw)
+        invoice_external_id = f"INV-GEP-{yyyymm}-{partner_token}"
+
+        usage_mask = group["row_type"].fillna("").astype(str).str.lower() == "usage"
+        min_mask = group["row_type"].fillna("").astype(str).str.lower() == "min_trueup"
+        usage_group = group.loc[usage_mask].copy()
+        min_group = group.loc[min_mask].copy()
+
+        line_amounts: List[float] = []
+
+        if not usage_group.empty:
+            # Line A - End Users.
+            er_keys: set[str] = set()
+            for _, usage_row in usage_group.iterrows():
+                er_id = key(usage_row.get("ER_ID"))
+                if er_id:
+                    er_keys.add(f"id:{er_id}")
+                else:
+                    er_name = lower_key(usage_row.get("ER_NAME"))
+                    if er_name:
+                        er_keys.add(f"name:{er_name}")
+
+            end_user_quantity = len(er_keys)
+            end_users_amount = round2(
+                pd.to_numeric(usage_group["er_fee"], errors="coerce").fillna(0).sum()
+            )
+            end_users_unit_price = round2(end_users_amount / end_user_quantity) if end_user_quantity else 0.0
+
+            er_unit_prices = sorted(
+                set(
+                    float(v)
+                    for v in pd.to_numeric(usage_group["unit_price_er"], errors="coerce")
+                    .dropna()
+                    .tolist()
+                )
+            )
+            if len(er_unit_prices) > 1:
+                logger.warning(
+                    "Unit price check warning for invoice '%s': multiple unit_price_er values %s",
+                    invoice_external_id,
+                    er_unit_prices,
+                )
+
+            rows.append(
+                {
+                    "Customer": key(customer_name),
+                    "Invoice External ID": invoice_external_id,
+                    "Memo": memo,
+                    "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                    "Item": "Embedded Payroll",
+                    "Description": "End Users",
+                    "Quantity": end_user_quantity,
+                    "Unit Price": end_users_unit_price,
+                    "Amount": end_users_amount,
+                    "Product": "GEP Usage",
+                }
+            )
+            line_amounts.append(end_users_amount)
+
+            # Line B - Individual Users.
+            individual_quantity = round2(
+                pd.to_numeric(usage_group["user_fee_units_charged"], errors="coerce").fillna(0).sum()
+            )
+            individual_users_amount = round2(
+                pd.to_numeric(usage_group["iu_fee"], errors="coerce").fillna(0).sum()
+            )
+            individual_unit_price = (
+                round2(individual_users_amount / individual_quantity) if individual_quantity else 0.0
+            )
+
+            rows.append(
+                {
+                    "Customer": key(customer_name),
+                    "Invoice External ID": invoice_external_id,
+                    "Memo": memo,
+                    "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                    "Item": "Embedded Payroll",
+                    "Description": "Individual Users",
+                    "Quantity": individual_quantity,
+                    "Unit Price": individual_unit_price,
+                    "Amount": individual_users_amount,
+                    "Product": "GEP Usage",
+                }
+            )
+            line_amounts.append(individual_users_amount)
+
+        # Line C - Minimum True-up.
+        if not min_group.empty:
+            minimum_trueup_amount = round2(
+                pd.to_numeric(min_group["total_fee"], errors="coerce").fillna(0).sum()
+            )
+            rows.append(
+                {
+                    "Customer": key(customer_name),
+                    "Invoice External ID": invoice_external_id,
+                    "Memo": memo,
+                    "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                    "Item": "Embedded Payroll : Monthly Minimum",
+                    "Description": "Minimum True-up",
+                    "Quantity": 1,
+                    "Unit Price": "",
+                    "Amount": minimum_trueup_amount,
+                    "Product": "GEP Minimums",
+                }
+            )
+            line_amounts.append(minimum_trueup_amount)
+
+        input_total = round2(
+            pd.to_numeric(usage_group["er_fee"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(usage_group["iu_fee"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(min_group["total_fee"], errors="coerce").fillna(0).sum()
+        )
+        output_total = round2(sum(line_amounts))
+        if abs(input_total - output_total) > 0.01:
+            logger.warning(
+                "Tie-out warning for invoice '%s': input_fees=%s output_line_amounts=%s",
+                invoice_external_id,
+                input_total,
+                output_total,
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    netsuite_df = pd.DataFrame(rows, columns=output_columns)
+    netsuite_df.to_csv(output_path, index=False)
+
+
+def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) -> None:
+    """Create a two-tab master billing dashboard workbook."""
+    data = df_usage.copy()
+
+    if "PARTNER_NAME" not in data.columns:
+        data["PARTNER_NAME"] = ""
+    if "PARTNER_ID" not in data.columns:
+        data["PARTNER_ID"] = ""
+    if "row_type" not in data.columns:
+        data["row_type"] = ""
+    if "ER_ID" not in data.columns:
+        data["ER_ID"] = ""
+    if "ER_NAME" not in data.columns:
+        data["ER_NAME"] = ""
+    if "user_fee_units_charged" not in data.columns:
+        data["user_fee_units_charged"] = 0
+    if "total_fee" not in data.columns:
+        data["total_fee"] = 0
+
+    data["_partner_name"] = data["PARTNER_NAME"].apply(key)
+    fallback_partner_id = data["PARTNER_ID"].apply(key)
+    data["_partner_name"] = data["_partner_name"].where(
+        data["_partner_name"] != "",
+        fallback_partner_id.where(fallback_partner_id != "", "Unknown Partner"),
+    )
+
+    row_type_norm = data["row_type"].fillna("").astype(str).str.lower()
+    usage = data.loc[row_type_norm == "usage"].copy()
+    minimums = data.loc[row_type_norm == "min_trueup"].copy()
+
+    usage["_er_key"] = usage.apply(
+        lambda r: f"id:{key(r.get('ER_ID'))}"
+        if key(r.get("ER_ID"))
+        else (f"name:{lower_key(r.get('ER_NAME'))}" if lower_key(r.get("ER_NAME")) else ""),
+        axis=1,
+    )
+    usage_for_end_users = usage.loc[usage["_er_key"] != ""].copy()
+
+    usage["_billable_users"] = pd.to_numeric(usage["user_fee_units_charged"], errors="coerce").fillna(0)
+    usage["_usage_revenue"] = pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0)
+    minimums["_minimum_revenue"] = pd.to_numeric(minimums["total_fee"], errors="coerce").fillna(0)
+
+    partners = sorted(set(data["_partner_name"].tolist()))
+    summary = pd.DataFrame(index=partners)
+    summary.index.name = "Partner Name"
+
+    summary["Active End Users"] = (
+        usage_for_end_users.groupby("_partner_name")["_er_key"].nunique().reindex(summary.index, fill_value=0)
+    )
+    summary["Billable Indiv. Users"] = (
+        usage.groupby("_partner_name")["_billable_users"].sum().reindex(summary.index, fill_value=0)
+    )
+    summary["Usage Revenue"] = (
+        usage.groupby("_partner_name")["_usage_revenue"].sum().reindex(summary.index, fill_value=0.0)
+    )
+    summary["Minimum Revenue"] = (
+        minimums.groupby("_partner_name")["_minimum_revenue"].sum().reindex(summary.index, fill_value=0.0)
+    )
+    summary["Total Billed"] = summary["Usage Revenue"] + summary["Minimum Revenue"]
+    summary["% from Minimums"] = summary.apply(
+        lambda r: (r["Minimum Revenue"] / r["Total Billed"]) if r["Total Billed"] else 0,
+        axis=1,
+    )
+
+    summary = summary.sort_values(by="Total Billed", ascending=False)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        summary.to_excel(writer, sheet_name="Executive Summary")
+        data.drop(columns=["_partner_name"], errors="ignore").to_excel(
+            writer, sheet_name="Source Data", index=False
+        )
+
+        workbook = writer.book
+        ws_summary = writer.sheets["Executive Summary"]
+        ws_source = writer.sheets["Source Data"]
+
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "align": "center",
+                "valign": "vcenter",
+                "bg_color": "#D9D9D9",
+            }
+        )
+        fmt_count = workbook.add_format({"num_format": "#,##0"})
+        fmt_currency = workbook.add_format({"num_format": "#,##0.00"})
+        fmt_percent = workbook.add_format({"num_format": "0%"})
+
+        ws_summary.set_row(0, None, header_fmt)
+
+        summary_formats = {
+            1: fmt_count,      # Active End Users
+            2: fmt_count,      # Billable Indiv. Users
+            3: fmt_currency,   # Usage Revenue
+            4: fmt_currency,   # Minimum Revenue
+            5: fmt_currency,   # Total Billed
+            6: fmt_percent,    # % from Minimums
+        }
+
+        summary_index_strings = [str(v) for v in summary.index.tolist()]
+        idx_width = max([len("Partner Name")] + [len(v) for v in summary_index_strings]) + 2
+        ws_summary.set_column(0, 0, max(15, min(20, idx_width)))
+
+        for col_idx, col_name in enumerate(summary.columns, start=1):
+            val_strings = [str(v) for v in summary[col_name].tolist()]
+            width = max([len(str(col_name))] + [len(v) for v in val_strings]) + 2
+            ws_summary.set_column(
+                col_idx,
+                col_idx,
+                max(15, min(20, width)),
+                summary_formats.get(col_idx),
+            )
+
+        ws_source.freeze_panes(1, 0)
+
+
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
@@ -815,13 +1168,21 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     outputs_dir.mkdir(parents=True, exist_ok=True)
     partner_dir = outputs_dir / "gep_partner_details"
     partner_dir.mkdir(parents=True, exist_ok=True)
+    history_path = outputs_dir / "gep_billing_log"
+    history_path.mkdir(parents=True, exist_ok=True)
+    netsuite_template_path = outputs_dir / "gep_netsuite_invoice_import.csv"
+    logger.debug("NetSuite upload template path: %s", netsuite_template_path)
 
     output_columns = order_columns(out_rows)
     master_df = pd.DataFrame(out_rows, columns=output_columns)
 
-    master_path = outputs_dir / "NetSuite_Import_Staging.csv"
-    master_df.to_csv(master_path, index=False)
-    logger.info("Wrote master staging file: %s", master_path)
+    billing_period = f"{for_month_any.year:04d}.{for_month_any.month:02d}"
+    history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
+    generate_master_billing_report(master_df, history_file_path)
+    logger.info("Wrote master billing report: %s", history_file_path)
+
+    generate_netsuite_import_file(master_df, netsuite_template_path)
+    logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
 
     # Partner split files.
     if "PARTNER_NAME" not in master_df.columns:
