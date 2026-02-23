@@ -1413,14 +1413,6 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     if "FOR_MONTH" not in master_df.columns:
         raise BillingEngineError("FOR_MONTH column missing from output data.")
 
-    detail_columns: List[str] = []
-    for col in usage_source_columns + PARTNER_DETAIL_CALC_COLUMNS:
-        if col not in detail_columns:
-            detail_columns.append(col)
-    for col in detail_columns:
-        if col not in master_df.columns:
-            master_df[col] = ""
-
     for partner_name, group in master_df.groupby("PARTNER_NAME", dropna=False):
         group_partner_name = key(partner_name)
         if not group_partner_name:
@@ -1440,13 +1432,61 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         file_name = f"{partner_display} - {year_month}.xlsx"
         file_path = partner_folder_path / file_name
 
-        detail_df = group.loc[:, detail_columns].copy()
+        has_next_day_fees = False
+        if "next_day_er_fee" in group.columns and "next_day_iu_fee" in group.columns:
+            next_day_total = (
+                pd.to_numeric(group["next_day_er_fee"], errors="coerce").fillna(0).sum()
+                + pd.to_numeric(group["next_day_iu_fee"], errors="coerce").fillna(0).sum()
+            )
+            has_next_day_fees = next_day_total > 0
+
+        has_mrb = False
+        if "IS_MRB" in group.columns:
+            mrb_values = (
+                group["IS_MRB"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            has_mrb = mrb_values.isin({"yes", "true", "1"}).any()
+
+        base_columns: List[str] = []
+        for col in usage_source_columns:
+            if col == "CURRENT_ACH_SPEED":
+                if has_next_day_fees:
+                    base_columns.append(col)
+                continue
+            if col in {"IS_MRB", "MRB_BILLING_ANNIVERSARY"}:
+                if has_mrb:
+                    base_columns.append(col)
+                continue
+            base_columns.append(col)
+
+        detail_columns: List[str] = []
+        for col in base_columns + PARTNER_DETAIL_CALC_COLUMNS:
+            if col not in detail_columns:
+                detail_columns.append(col)
+        if has_next_day_fees:
+            for col in ["unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"]:
+                if col not in detail_columns:
+                    detail_columns.append(col)
+
+        detail_df = group.copy()
+        for col in detail_columns:
+            if col not in detail_df.columns:
+                detail_df[col] = ""
+        detail_df = detail_df.loc[:, detail_columns]
 
         # Normalize known numeric output columns before applying Excel formats.
         for col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
             if col_name in detail_df.columns:
                 detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
-        for col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+
+        financial_columns = set(PARTNER_DETAIL_FINANCIAL_COLUMNS)
+        if has_next_day_fees:
+            financial_columns.update({"unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"})
+        for col_name in financial_columns:
             if col_name in detail_df.columns:
                 detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
 
@@ -1463,7 +1503,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 col_fmt = None
                 if col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
                     col_fmt = fmt_int
-                elif col_name in PARTNER_DETAIL_FINANCIAL_COLUMNS:
+                elif col_name in financial_columns:
                     col_fmt = fmt_money
                 worksheet.set_column(col_idx, col_idx, 18, col_fmt)
 
