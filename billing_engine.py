@@ -1224,8 +1224,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row["er_fee"] = round2(company_fee)
         row["iu_fee"] = round2(user_fee)
 
-        speed_raw = key(row.get("CURRENT_ACH_SPEED")).strip().lower()
-        if speed_raw == "1-day":
+        if looks_like_ach_override(row.get("CURRENT_ACH_SPEED")):
             row["next_day_fee_er"] = round2(selected_tier.next_day_fee_er)
             row["next_day_fee_iu"] = round2(selected_tier.next_day_fee_iu)
             row["next_day_amount_er"] = round2(row["next_day_fee_er"])
