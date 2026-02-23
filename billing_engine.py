@@ -970,6 +970,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         tiers_by_partner[p_key].sort(key=lambda t: t.start)
 
     partner_tier_mode: Dict[str, str] = {}
+    partner_metric_by_partner: Dict[str, str] = {}
     for p_key, partner_tiers in tiers_by_partner.items():
         tier_types = {tier.tier_type for tier in partner_tiers}
         if len(tier_types) > 1:
@@ -980,13 +981,19 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             )
         partner_tier_mode[p_key] = "SPLIT" if "SPLIT" in tier_types else "ALL_IN"
 
-    billable_units_by_partner: Dict[str, int] = {}
-    for row in usage_rows:
-        p_key = usage_partner_key(row)
-        c_key = usage_company_key(row)
-        if not p_key or not c_key:
-            continue
-        billable_units_by_partner[p_key] = billable_units_by_partner.get(p_key, 0) + 1
+        metric_candidates = [tier.metric for tier in partner_tiers if tier.metric in {"IU", "ER", "FLAT"}]
+        if not metric_candidates:
+            partner_metric_by_partner[p_key] = "FLAT"
+        else:
+            chosen_metric = metric_candidates[0]
+            if len(set(metric_candidates)) > 1:
+                logger.warning(
+                    "Partner '%s' has mixed tier metrics %s. Using '%s'.",
+                    p_key,
+                    sorted(set(metric_candidates)),
+                    chosen_metric,
+                )
+            partner_metric_by_partner[p_key] = chosen_metric
 
     def select_tier_for_value(tiers: List[Tier], value: float) -> Optional[Tier]:
         if not tiers:
@@ -994,19 +1001,44 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         matched = [tier for tier in tiers if tier.start <= value <= tier.end]
         if matched:
             return max(matched, key=lambda tier: tier.start)
+        if value < min(tier.start for tier in tiers):
+            return min(tiers, key=lambda tier: tier.start)
         return max(tiers, key=lambda tier: tier.start)
 
     all_in_tier_by_partner: Dict[str, Optional[Tier]] = {}
     split_tiers_by_partner: Dict[str, List[Tier]] = {}
+    total_metric_units_by_partner: Dict[str, float] = {}
+    seen_er_for_total: Dict[str, set[str]] = {}
     for p_key, partner_tiers in tiers_by_partner.items():
-        split_tiers = [tier for tier in partner_tiers if tier.tier_type == "SPLIT"]
-        all_in_tiers = [tier for tier in partner_tiers if tier.tier_type == "ALL_IN"]
+        metric = partner_metric_by_partner.get(p_key, "FLAT")
+        metric_tiers = [tier for tier in partner_tiers if tier.metric == metric]
+        if not metric_tiers:
+            metric_tiers = partner_tiers
+
+        split_tiers = [tier for tier in metric_tiers if tier.tier_type == "SPLIT"]
+        all_in_tiers = [tier for tier in metric_tiers if tier.tier_type == "ALL_IN"]
         if not split_tiers:
-            split_tiers = partner_tiers
+            split_tiers = metric_tiers
         if not all_in_tiers:
-            all_in_tiers = partner_tiers
+            all_in_tiers = metric_tiers
         split_tiers_by_partner[p_key] = split_tiers
-        total_units = billable_units_by_partner.get(p_key, 0)
+        total_metric_units_by_partner[p_key] = 0.0
+        seen_er_for_total[p_key] = set()
+        total_units = 0.0
+        for usage_row in usage_rows:
+            row_partner = usage_partner_key(usage_row)
+            row_company = usage_company_key(usage_row)
+            if row_partner != p_key or not row_company:
+                continue
+            if metric == "IU":
+                total_units += max(num(usage_row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+            elif metric == "ER":
+                if row_company not in seen_er_for_total[p_key]:
+                    seen_er_for_total[p_key].add(row_company)
+                    total_units += 1.0
+            else:  # FLAT
+                total_units += 1.0
+        total_metric_units_by_partner[p_key] = total_units
         all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
 
     # FOR_MONTH is required by the workflow logic.
@@ -1022,7 +1054,8 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     for_month_any = date(for_month_parsed.year, for_month_parsed.month, 1)
 
     # Pass 1: fee computation.
-    split_running_unit: Dict[str, int] = {}
+    split_running_unit: Dict[str, float] = {}
+    split_seen_er: Dict[str, set[str]] = {}
     out_rows: List[Dict[str, Any]] = []
     partner_totals: Dict[str, float] = {}
 
@@ -1074,20 +1107,33 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             continue
 
         mode = partner_tier_mode.get(p_key, "ALL_IN")
+        metric = partner_metric_by_partner.get(p_key, "FLAT")
         selected_tier: Optional[Tier] = None
         metric_value_used: float = 0.0
         if mode == "SPLIT":
-            split_running_unit[p_key] = split_running_unit.get(p_key, 0) + 1
+            if metric == "IU":
+                increment = max(num(row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+            elif metric == "ER":
+                seen = split_seen_er.setdefault(p_key, set())
+                increment = 0.0
+                if c_key not in seen:
+                    seen.add(c_key)
+                    increment = 1.0
+            else:  # FLAT
+                increment = 1.0
+            split_running_unit[p_key] = split_running_unit.get(p_key, 0.0) + increment
             metric_value_used = float(split_running_unit[p_key])
+            tier_value = metric_value_used if metric_value_used > 0 else 1.0
             selected_tier = select_tier_for_value(
                 split_tiers_by_partner.get(p_key, tiers),
-                metric_value_used,
+                tier_value,
             )
         else:
-            metric_value_used = float(billable_units_by_partner.get(p_key, 0))
+            metric_value_used = float(total_metric_units_by_partner.get(p_key, 0.0))
+            tier_value = metric_value_used if metric_value_used > 0 else 1.0
             selected_tier = all_in_tier_by_partner.get(p_key)
             if selected_tier is None:
-                selected_tier = select_tier_for_value(tiers, metric_value_used)
+                selected_tier = select_tier_for_value(tiers, tier_value)
 
         if selected_tier is None:
             row["fee_calc_status"] = "missing_tier"
@@ -1110,7 +1156,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         company_fee = selected_tier.company_fee
         user_fee = round2(chargeable_users * selected_tier.user_fee)
 
-        row["partner_tier_metric"] = selected_tier.tier_type
+        row["partner_tier_metric"] = selected_tier.metric
         row["tier_start"] = selected_tier.start
         row["tier_end"] = (
             selected_tier.end if math.isfinite(selected_tier.end) else ""
