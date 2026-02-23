@@ -297,16 +297,22 @@ def execute_run(
     return record
 
 
-def render_download_button(label: str, path_str: str) -> None:
+def render_download_button(label: str, path_str: str, button_key: str) -> None:
     if not path_str:
         return
     path = Path(path_str)
     if not path.exists() or not path.is_file():
         return
-    st.download_button(label, data=path.read_bytes(), file_name=path.name, mime="application/octet-stream")
+    st.download_button(
+        label,
+        data=path.read_bytes(),
+        file_name=path.name,
+        mime="application/octet-stream",
+        key=button_key,
+    )
 
 
-def render_run_details(record: Dict[str, Any]) -> None:
+def render_run_details(record: Dict[str, Any], context_key: str) -> None:
     st.subheader(f"Run {record.get('run_id')}")
     st.write(
         {
@@ -328,14 +334,32 @@ def render_run_details(record: Dict[str, Any]) -> None:
         st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
 
     col1, col2, col3, col4 = st.columns(4)
+    run_id = record.get("run_id", "unknown")
+    key_prefix = f"{context_key}_{run_id}"
     with col1:
-        render_download_button("Master Billing Report", record.get("master_billing_report", ""))
+        render_download_button(
+            "Master Billing Report",
+            record.get("master_billing_report", ""),
+            button_key=f"{key_prefix}_dl_master",
+        )
     with col2:
-        render_download_button("NetSuite Import CSV", record.get("netsuite_import_file", ""))
+        render_download_button(
+            "NetSuite Import CSV",
+            record.get("netsuite_import_file", ""),
+            button_key=f"{key_prefix}_dl_netsuite",
+        )
     with col3:
-        render_download_button("Partner Details ZIP", record.get("partner_details_zip", ""))
+        render_download_button(
+            "Partner Details ZIP",
+            record.get("partner_details_zip", ""),
+            button_key=f"{key_prefix}_dl_partner_zip",
+        )
     with col4:
-        render_download_button("Run Manifest JSON", record.get("run_manifest", ""))
+        render_download_button(
+            "Run Manifest JSON",
+            record.get("run_manifest", ""),
+            button_key=f"{key_prefix}_dl_manifest",
+        )
 
     if record.get("slack_error"):
         st.warning(record["slack_error"])
@@ -410,7 +434,7 @@ def main() -> None:
                 st.success("Run completed.")
             else:
                 st.error("Run failed.")
-            render_run_details(record)
+            render_run_details(record, context_key="run_result")
 
         last_run_id = st.session_state.get("last_run_id")
         if last_run_id:
@@ -419,7 +443,7 @@ def main() -> None:
             last_path = run_record_path(last_run_id)
             if last_path.exists():
                 with last_path.open("r", encoding="utf-8") as handle:
-                    render_run_details(json.load(handle))
+                    render_run_details(json.load(handle), context_key="last_run")
 
     with tab_history:
         st.markdown("### Run History")
@@ -442,7 +466,7 @@ def main() -> None:
             selected_id = st.selectbox("Select a run", options=[r["run_id"] for r in records])
             selected = next((r for r in records if r["run_id"] == selected_id), None)
             if selected:
-                render_run_details(selected)
+                render_run_details(selected, context_key="history_selected")
 
 
 if __name__ == "__main__":
