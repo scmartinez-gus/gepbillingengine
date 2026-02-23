@@ -15,10 +15,14 @@ This script replicates the core fee logic from the supplied n8n workflow:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -471,6 +475,33 @@ def month_end(day: date) -> date:
     return first_next - timedelta(days=1)
 
 
+def file_sha256(path: Path) -> str:
+    """Compute SHA256 hash for a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_commit_short() -> str:
+    """Best-effort git commit hash for traceability."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
 def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> None:
     """Create NetSuite invoice import CSV using strict BRD schema and rules."""
     logger = logging.getLogger("billing_engine")
@@ -803,8 +834,13 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
 
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
+    run_started_at = datetime.utcnow().replace(microsecond=0)
+    run_id = run_started_at.strftime("%Y%m%dT%H%M%SZ")
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
     config_path = inputs_dir / config_filename
+    usage_file_hash = file_sha256(usage_file)
+    rules_file_hash = file_sha256(config_path)
+    rules_last_modified = datetime.utcfromtimestamp(config_path.stat().st_mtime).replace(microsecond=0)
 
     logger.info("Loading usage CSV...")
     usage_df = pd.read_csv(usage_file, dtype=object)
@@ -1170,6 +1206,8 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     partner_dir.mkdir(parents=True, exist_ok=True)
     history_path = outputs_dir / "gep_billing_log"
     history_path.mkdir(parents=True, exist_ok=True)
+    rules_snapshot_dir = history_path / "rules_snapshots"
+    rules_snapshot_dir.mkdir(parents=True, exist_ok=True)
     netsuite_template_path = outputs_dir / "gep_netsuite_invoice_import.csv"
     logger.debug("NetSuite upload template path: %s", netsuite_template_path)
 
@@ -1177,6 +1215,12 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     master_df = pd.DataFrame(out_rows, columns=output_columns)
 
     billing_period = f"{for_month_any.year:04d}.{for_month_any.month:02d}"
+    rules_snapshot_name = (
+        f"rules_snapshot_{billing_period.replace('.', '-')}_{run_id}{config_path.suffix or '.xlsx'}"
+    )
+    rules_snapshot_path = rules_snapshot_dir / rules_snapshot_name
+    shutil.copy2(config_path, rules_snapshot_path)
+
     history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
     generate_master_billing_report(master_df, history_file_path)
     logger.info("Wrote master billing report: %s", history_file_path)
@@ -1245,6 +1289,35 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 worksheet.set_column(col_idx, col_idx, 18, col_fmt)
 
         logger.info("Wrote partner detail file: %s", file_path)
+
+    manifest = {
+        "run_id": run_id,
+        "run_timestamp_utc": f"{run_started_at.isoformat()}Z",
+        "billing_period": billing_period,
+        "engine_git_commit": git_commit_short(),
+        "usage_file": {
+            "path": str(usage_file),
+            "name": usage_file.name,
+            "sha256": usage_file_hash,
+        },
+        "rules_file": {
+            "path": str(config_path),
+            "name": config_path.name,
+            "last_modified_utc": f"{rules_last_modified.isoformat()}Z",
+            "sha256": rules_file_hash,
+            "snapshot_path": str(rules_snapshot_path),
+        },
+        "outputs": {
+            "master_billing_report": str(history_file_path),
+            "netsuite_import_file": str(netsuite_template_path),
+            "partner_details_folder": str(partner_dir),
+        },
+        "status": "completed",
+    }
+    manifest_path = history_path / f"{billing_period}_run_manifest_{run_id}.json"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    logger.info("Wrote run manifest: %s", manifest_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
