@@ -7,7 +7,7 @@ This script replicates the core fee logic from the supplied n8n workflow:
 3. Calculate ER and IU fees from tier rules with ACH override behavior.
 4. Apply partner minimum true-up adjustments when applicable.
 5. Write:
-   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Calculation.csv
+   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Billing_Report.xlsx
    - ./outputs/gep_netsuite_invoice_import.csv
    - ./outputs/gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
 """
@@ -26,7 +26,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -835,13 +835,17 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
 
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
-    run_started_at = datetime.utcnow().replace(microsecond=0)
+    run_started_at = datetime.now(timezone.utc).replace(microsecond=0)
     run_id = run_started_at.strftime("%Y%m%dT%H%M%SZ")
     usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
     config_path = inputs_dir / config_filename
+    if not config_path.exists():
+        raise BillingEngineError(f"Config workbook not found: {config_path}")
     usage_file_hash = file_sha256(usage_file)
     rules_file_hash = file_sha256(config_path)
-    rules_last_modified = datetime.utcfromtimestamp(config_path.stat().st_mtime).replace(microsecond=0)
+    rules_last_modified = datetime.fromtimestamp(
+        config_path.stat().st_mtime, tz=timezone.utc
+    ).replace(microsecond=0)
 
     logger.info("Loading usage CSV...")
     usage_df = pd.read_csv(usage_file, dtype=object)
@@ -852,6 +856,9 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         usage_df["partner_name"] = ""
     if "first_billable_activity_date" not in usage_df.columns:
         usage_df["first_billable_activity_date"] = pd.NaT
+    usage_df["first_billable_activity_date"] = usage_df[
+        "first_billable_activity_date"
+    ].apply(parse_date)
     usage_df["first_billable_activity_date"] = pd.to_datetime(
         usage_df["first_billable_activity_date"], errors="coerce"
     )
@@ -1326,7 +1333,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
 
     manifest = {
         "run_id": run_id,
-        "run_timestamp_utc": f"{run_started_at.isoformat()}Z",
+        "run_timestamp_utc": run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "billing_period": billing_period,
         "engine_git_commit": git_commit_short(),
         "usage_file": {
@@ -1337,7 +1344,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         "rules_file": {
             "path": str(config_path),
             "name": config_path.name,
-            "last_modified_utc": f"{rules_last_modified.isoformat()}Z",
+            "last_modified_utc": rules_last_modified.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sha256": rules_file_hash,
             "snapshot_path": str(rules_snapshot_path),
         },
