@@ -102,6 +102,7 @@ PREFERRED_OUTPUT_COLUMNS = [
     "CURRENT_ACH_SPEED",
     "IS_MRB",
     "MRB_BILLING_ANNIVERSARY",
+    "tier_type",
     "partner_tier_metric",
     "tier_start",
     "tier_end",
@@ -1110,6 +1111,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         metric = partner_metric_by_partner.get(p_key, "FLAT")
         selected_tier: Optional[Tier] = None
         metric_value_used: float = 0.0
+        row["tier_type"] = mode
         if mode == "SPLIT":
             if metric == "IU":
                 increment = max(num(row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
@@ -1238,6 +1240,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 "netsuite_customer_name": ns_name,
                 "unit_price_iu": 0.0,
                 "unit_price_er": 0.0,
+                "tier_type": partner_tier_mode.get(p_key, "ALL_IN"),
                 "partner_tier_metric": "MIN",
                 "tier_start": now_idx,
                 "tier_end": now_idx,
@@ -1272,6 +1275,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row.setdefault("partner_minimum_month_index", "")
         row.setdefault("partner_minimum_amount", "")
         row.setdefault("partner_minimum_shortfall", "")
+        row.setdefault("tier_type", "")
         row.setdefault("partner_tier_metric", "")
         row.setdefault("tier_start", "")
         row.setdefault("tier_end", "")
