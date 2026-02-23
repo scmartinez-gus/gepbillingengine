@@ -70,7 +70,12 @@ DEFAULT_INPUTS_DIR = Path(
     "Revenue Accounting - Perm Files/Embedded Payroll/Invoice Support/"
     "billing_engine_test/inputs"
 )
-DEFAULT_OUTPUTS_DIR = Path("outputs")
+DEFAULT_OUTPUTS_DIR = Path(
+    "/Users/sam.martinez/Library/CloudStorage/GoogleDrive-sam.martinez@gusto.com/"
+    "Shared drives/Accounting Shared Drive (Public)/8 - Team Perm Files/"
+    "Revenue Accounting - Perm Files/Embedded Payroll/Invoice Support/"
+    "billing_engine_test/outputs"
+)
 DEFAULT_CONFIG_FILE = "gep_billing_rules.xlsx"
 DEFAULT_USAGE_PREFIX = "gepusage"
 
