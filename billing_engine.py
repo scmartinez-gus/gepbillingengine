@@ -1481,9 +1481,11 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             if col not in detail_columns:
                 detail_columns.append(col)
         if has_next_day_fees:
-            for col in ["unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"]:
+            for col in ["next_day_er_fee", "unit_price_next_day_iu", "next_day_iu_fee"]:
                 if col not in detail_columns:
                     detail_columns.append(col)
+        if "total_fee" in detail_columns:
+            detail_columns = [col for col in detail_columns if col != "total_fee"] + ["total_fee"]
 
         detail_df = group.copy()
         for col in detail_columns:
