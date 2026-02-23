@@ -60,6 +60,8 @@ class Tier:
     user_fee: float
     included: int
     tier_type: str = "ALL_IN"
+    next_day_fee_er: float = 0.0
+    next_day_fee_iu: float = 0.0
 
 
 DEFAULT_INPUTS_DIR = Path(
@@ -114,6 +116,10 @@ PREFERRED_OUTPUT_COLUMNS = [
     "er_fee",
     "unit_price_iu",
     "iu_fee",
+    "next_day_fee_er",
+    "next_day_fee_iu",
+    "next_day_amount_er",
+    "next_day_amount_iu",
     "total_fee",
     "fee_calc_status",
     "row_type",
@@ -733,6 +739,14 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
         data["ER_NAME"] = ""
     if "user_fee_units_charged" not in data.columns:
         data["user_fee_units_charged"] = 0
+    if "er_fee" not in data.columns:
+        data["er_fee"] = 0
+    if "iu_fee" not in data.columns:
+        data["iu_fee"] = 0
+    if "next_day_amount_er" not in data.columns:
+        data["next_day_amount_er"] = 0
+    if "next_day_amount_iu" not in data.columns:
+        data["next_day_amount_iu"] = 0
     if "total_fee" not in data.columns:
         data["total_fee"] = 0
 
@@ -756,7 +770,14 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
     usage_for_end_users = usage.loc[usage["_er_key"] != ""].copy()
 
     usage["_billable_users"] = pd.to_numeric(usage["user_fee_units_charged"], errors="coerce").fillna(0)
-    usage["_usage_revenue"] = pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0)
+    usage["_usage_revenue"] = (
+        pd.to_numeric(usage["er_fee"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["iu_fee"], errors="coerce").fillna(0)
+    )
+    usage["_next_day_fee_revenue"] = (
+        pd.to_numeric(usage["next_day_amount_er"], errors="coerce").fillna(0)
+        + pd.to_numeric(usage["next_day_amount_iu"], errors="coerce").fillna(0)
+    )
     minimums["_minimum_revenue"] = pd.to_numeric(minimums["total_fee"], errors="coerce").fillna(0)
 
     partners = sorted(set(data["_partner_name"].tolist()))
@@ -772,10 +793,15 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
     summary["Usage Revenue"] = (
         usage.groupby("_partner_name")["_usage_revenue"].sum().reindex(summary.index, fill_value=0.0)
     )
+    summary["Next Day Fee Revenue"] = (
+        usage.groupby("_partner_name")["_next_day_fee_revenue"].sum().reindex(summary.index, fill_value=0.0)
+    )
     summary["Minimum Revenue"] = (
         minimums.groupby("_partner_name")["_minimum_revenue"].sum().reindex(summary.index, fill_value=0.0)
     )
-    summary["Total Billed"] = summary["Usage Revenue"] + summary["Minimum Revenue"]
+    summary["Total Billed"] = (
+        summary["Usage Revenue"] + summary["Next Day Fee Revenue"] + summary["Minimum Revenue"]
+    )
     summary["% from Minimums"] = summary.apply(
         lambda r: (r["Minimum Revenue"] / r["Total Billed"]) if r["Total Billed"] else 0,
         axis=1,
@@ -812,9 +838,10 @@ def generate_master_billing_report(df_usage: pd.DataFrame, output_path: Path) ->
             1: fmt_count,      # Active End Users
             2: fmt_count,      # Billable Indiv. Users
             3: fmt_currency,   # Usage Revenue
-            4: fmt_currency,   # Minimum Revenue
-            5: fmt_currency,   # Total Billed
-            6: fmt_percent,    # % from Minimums
+            4: fmt_currency,   # Next Day Fee Revenue
+            5: fmt_currency,   # Minimum Revenue
+            6: fmt_currency,   # Total Billed
+            7: fmt_percent,    # % from Minimums
         }
 
         summary_index_strings = [str(v) for v in summary.index.tolist()]
@@ -868,10 +895,24 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         ascending=[True, True],
     ).reset_index(drop=True)
     usage_source_columns = [str(col).upper() for col in usage_df.columns]
+    usage_df["next_day_fee_er"] = 0.0
+    usage_df["next_day_fee_iu"] = 0.0
+    usage_df["next_day_amount_er"] = 0.0
+    usage_df["next_day_amount_iu"] = 0.0
 
     logger.info("Loading rules workbook...")
     sheets = load_rules_workbook(config_path)
     pricing_df = sheets[SHEET_PRICING]
+    if "next_day_fee_er" not in pricing_df.columns:
+        pricing_df["next_day_fee_er"] = 0.0
+    if "next_day_fee_iu" not in pricing_df.columns:
+        pricing_df["next_day_fee_iu"] = 0.0
+    pricing_df["next_day_fee_er"] = pd.to_numeric(
+        pricing_df["next_day_fee_er"], errors="coerce"
+    ).fillna(0.0)
+    pricing_df["next_day_fee_iu"] = pd.to_numeric(
+        pricing_df["next_day_fee_iu"], errors="coerce"
+    ).fillna(0.0)
     minimums_df = sheets[SHEET_MINIMUMS]
     config_df = sheets[SHEET_CONFIG]
     mapping_df = sheets[SHEET_MAPPING]
@@ -965,6 +1006,8 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
             if num(value_from_aliases(row, ["include_iu", "included_users_in_company_fee", "included"])) > 0
             else 0,
             tier_type=tier_type_value,
+            next_day_fee_er=num(value_from_aliases(row, ["next_day_fee_er"])),
+            next_day_fee_iu=num(value_from_aliases(row, ["next_day_fee_iu"])),
         )
         tiers_by_partner.setdefault(p_key, []).append(tier)
     for p_key in tiers_by_partner:
@@ -1075,6 +1118,16 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
 
         if "company_uuid" in row and "COMPANY_UUID" not in row:
             row["COMPANY_UUID"] = row.pop("company_uuid")
+        for raw_col, norm_col in (
+            ("NEXT_DAY_FEE_ER", "next_day_fee_er"),
+            ("NEXT_DAY_FEE_IU", "next_day_fee_iu"),
+            ("NEXT_DAY_AMOUNT_ER", "next_day_amount_er"),
+            ("NEXT_DAY_AMOUNT_IU", "next_day_amount_iu"),
+        ):
+            if raw_col in row and norm_col not in row:
+                row[norm_col] = num(row.pop(raw_col))
+            else:
+                row.setdefault(norm_col, 0.0)
 
         row["netsuite_customer_name"] = lookup_netsuite_name(
             partner_id_raw, partner_name_raw, p_key
@@ -1170,7 +1223,27 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row["unit_price_er"] = selected_tier.company_fee
         row["er_fee"] = round2(company_fee)
         row["iu_fee"] = round2(user_fee)
-        row["total_fee"] = round2(row["er_fee"] + row["iu_fee"])
+
+        speed_raw = key(row.get("CURRENT_ACH_SPEED")).strip().lower()
+        if speed_raw == "1-day":
+            row["next_day_fee_er"] = round2(selected_tier.next_day_fee_er)
+            row["next_day_fee_iu"] = round2(selected_tier.next_day_fee_iu)
+            row["next_day_amount_er"] = round2(row["next_day_fee_er"])
+            row["next_day_amount_iu"] = round2(
+                row["next_day_fee_iu"] * num(row.get("user_fee_units_charged"))
+            )
+        else:
+            row["next_day_fee_er"] = 0.0
+            row["next_day_fee_iu"] = 0.0
+            row["next_day_amount_er"] = 0.0
+            row["next_day_amount_iu"] = 0.0
+
+        row["total_fee"] = round2(
+            row["er_fee"]
+            + row["iu_fee"]
+            + row["next_day_amount_er"]
+            + row["next_day_amount_iu"]
+        )
         row["fee_calc_status"] = "ok"
         row["row_type"] = "usage"
 
@@ -1250,6 +1323,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 "user_fee_units_charged": 0,
                 "er_fee": 0.0,
                 "iu_fee": shortfall,
+                "next_day_fee_er": 0.0,
+                "next_day_fee_iu": 0.0,
+                "next_day_amount_er": 0.0,
+                "next_day_amount_iu": 0.0,
                 "total_fee": shortfall,
                 "fee_calc_status": "min_trueup",
                 "row_type": "min_trueup",
@@ -1287,6 +1364,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row.setdefault("unit_price_iu", "")
         row.setdefault("er_fee", "")
         row.setdefault("iu_fee", "")
+        row.setdefault("next_day_fee_er", 0.0)
+        row.setdefault("next_day_fee_iu", 0.0)
+        row.setdefault("next_day_amount_er", 0.0)
+        row.setdefault("next_day_amount_iu", 0.0)
         row.setdefault("total_fee", "")
         row.setdefault("fee_calc_status", "")
         row.setdefault("row_type", "usage")
