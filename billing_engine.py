@@ -831,6 +831,35 @@ def generate_master_billing_report(
         axis=1,
     )
 
+    if "tier_type" in usage.columns:
+        summary["Pricing Mode"] = (
+            usage.groupby("_partner_name")["tier_type"]
+            .first()
+            .reindex(summary.index, fill_value="ALL_IN")
+        )
+    else:
+        summary["Pricing Mode"] = "ALL_IN"
+
+    summary["Effective Rate per User"] = summary.apply(
+        lambda r: (r["Usage Revenue"] / r["Billable Indiv. Users"])
+        if r["Billable Indiv. Users"] else 0,
+        axis=1,
+    )
+
+    summary = summary[
+        [
+            "Pricing Mode",
+            "Active End Users",
+            "Billable Indiv. Users",
+            "Effective Rate per User",
+            "Usage Revenue",
+            "Next Day Fee Revenue",
+            "Minimum Revenue",
+            "Total Billed",
+            "% from Minimums",
+        ]
+    ]
+
     summary = summary.sort_values(by="Total Billed", ascending=False)
 
     # -------------------------------------------------------------------------
@@ -951,13 +980,14 @@ def generate_master_billing_report(
         # Executive summary formatting.
         ws_summary.set_row(0, None, header_fmt)
         summary_formats = {
-            1: fmt_count,      # Active End Users
-            2: fmt_count,      # Billable Indiv. Users
-            3: fmt_currency,   # Usage Revenue
-            4: fmt_currency,   # Next Day Fee Revenue
-            5: fmt_currency,   # Minimum Revenue
-            6: fmt_currency,   # Total Billed
-            7: fmt_percent,    # % from Minimums
+            2: fmt_count,      # Active End Users
+            3: fmt_count,      # Billable Indiv. Users
+            4: fmt_currency,   # Effective Rate per User
+            5: fmt_currency,   # Usage Revenue
+            6: fmt_currency,   # Next Day Fee Revenue
+            7: fmt_currency,   # Minimum Revenue
+            8: fmt_currency,   # Total Billed
+            9: fmt_percent,    # % from Minimums
         }
 
         summary_index_strings = [str(v) for v in summary.index.tolist()]
