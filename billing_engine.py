@@ -831,27 +831,57 @@ def generate_master_billing_report(
         axis=1,
     )
 
-    if "tier_type" in usage.columns:
+    _tier_cols = {"tier_type", "partner_tier_metric", "metric_value_used",
+                  "tier_start", "tier_end"}
+    if _tier_cols.issubset(usage.columns):
+        usage["_metric_value_num"] = pd.to_numeric(
+            usage["metric_value_used"], errors="coerce"
+        ).fillna(0)
+        _max_idx = usage.groupby("_partner_name")["_metric_value_num"].idxmax()
+        _tier_rows = usage.loc[_max_idx].set_index("_partner_name")
+
         summary["Pricing Mode"] = (
-            usage.groupby("_partner_name")["tier_type"]
-            .first()
-            .reindex(summary.index, fill_value="ALL_IN")
+            _tier_rows["tier_type"].reindex(summary.index, fill_value="ALL_IN")
+        )
+
+        def _fmt_metric_volume(row):
+            metric = str(row.get("partner_tier_metric", "")).strip() or "FLAT"
+            vol = row.get("_metric_value_num", 0)
+            return f"{metric} ({int(vol)})"
+
+        summary["Tier Metric & Volume"] = (
+            _tier_rows.apply(_fmt_metric_volume, axis=1)
+            .reindex(summary.index, fill_value="FLAT (0)")
+        )
+
+        def _fmt_tier_range(row):
+            start = row.get("tier_start", "")
+            end = row.get("tier_end", "")
+            start_num = pd.to_numeric(start, errors="coerce")
+            end_num = pd.to_numeric(end, errors="coerce")
+            if pd.isna(start_num):
+                return ""
+            start_int = int(start_num)
+            if pd.isna(end_num) or str(end).strip() == "":
+                return f"{start_int}+"
+            return f"{start_int} - {int(end_num)}"
+
+        summary["Highest Tier Reached"] = (
+            _tier_rows.apply(_fmt_tier_range, axis=1)
+            .reindex(summary.index, fill_value="")
         )
     else:
         summary["Pricing Mode"] = "ALL_IN"
-
-    summary["Effective Rate per User"] = summary.apply(
-        lambda r: (r["Usage Revenue"] / r["Billable Indiv. Users"])
-        if r["Billable Indiv. Users"] else 0,
-        axis=1,
-    )
+        summary["Tier Metric & Volume"] = ""
+        summary["Highest Tier Reached"] = ""
 
     summary = summary[
         [
             "Pricing Mode",
+            "Tier Metric & Volume",
+            "Highest Tier Reached",
             "Active End Users",
             "Billable Indiv. Users",
-            "Effective Rate per User",
             "Usage Revenue",
             "Next Day Fee Revenue",
             "Minimum Revenue",
@@ -980,14 +1010,13 @@ def generate_master_billing_report(
         # Executive summary formatting.
         ws_summary.set_row(0, None, header_fmt)
         summary_formats = {
-            2: fmt_count,      # Active End Users
-            3: fmt_count,      # Billable Indiv. Users
-            4: fmt_currency,   # Effective Rate per User
-            5: fmt_currency,   # Usage Revenue
-            6: fmt_currency,   # Next Day Fee Revenue
-            7: fmt_currency,   # Minimum Revenue
-            8: fmt_currency,   # Total Billed
-            9: fmt_percent,    # % from Minimums
+            4: fmt_count,      # Active End Users
+            5: fmt_count,      # Billable Indiv. Users
+            6: fmt_currency,   # Usage Revenue
+            7: fmt_currency,   # Next Day Fee Revenue
+            8: fmt_currency,   # Minimum Revenue
+            9: fmt_currency,   # Total Billed
+            10: fmt_percent,   # % from Minimums
         }
 
         summary_index_strings = [str(v) for v in summary.index.tolist()]
