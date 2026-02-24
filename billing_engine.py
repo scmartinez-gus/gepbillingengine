@@ -6,10 +6,10 @@ This script replicates the core fee logic from the supplied n8n workflow:
 2. Load gep_billing_rules.xlsx tabs: Pricing, Minimums, Config, Mapping.
 3. Calculate ER and IU fees from tier rules with ACH override behavior.
 4. Apply partner minimum true-up adjustments when applicable.
-5. Write:
-   - ./outputs/gep_billing_log/{YYYY.MM}_Master_Billing_Report.xlsx
-   - ./outputs/gep_netsuite_invoice_import.csv
-   - ./outputs/gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
+5. Write (default output root is the shared Google Drive billing_engine_test/outputs):
+   - gep_billing_log/{YYYY.MM}_Master_Billing_Report.xlsx
+   - gep_netsuite_invoice_import.csv
+   - gep_partner_details/{PartnerFolder}/{Partner Name} - YYYY.MM.xlsx
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import subprocess
@@ -421,6 +420,31 @@ def normalize_output_dates(row: Dict[str, Any]) -> None:
             row[column] = format_date_mdy_yy(parsed) if parsed else ""
 
 
+def _mark_row_no_fee(row: Dict[str, Any], status: str) -> None:
+    """Set zero-value fee fields and a status label on a usage row that cannot be priced."""
+    row["fee_calc_status"] = status
+    row["row_type"] = "usage"
+    row["company_fee_units_charged"] = 0
+    row["user_fee_units_charged"] = 0
+    row["unit_price_er"] = 0.0
+    row["unit_price_iu"] = 0.0
+    row["er_fee"] = 0.0
+    row["iu_fee"] = 0.0
+    row["total_fee"] = 0.0
+
+
+def select_tier_for_value(tiers: List[Tier], value: float) -> Optional[Tier]:
+    """Return the best-matching tier for *value*, falling back to boundary tiers."""
+    if not tiers:
+        return None
+    matched = [tier for tier in tiers if tier.start <= value <= tier.end]
+    if matched:
+        return max(matched, key=lambda tier: tier.start)
+    if value < min(tier.start for tier in tiers):
+        return min(tiers, key=lambda tier: tier.start)
+    return max(tiers, key=lambda tier: tier.start)
+
+
 def detect_usage_file(inputs_dir: Path, usage_prefix: str, logger: logging.Logger) -> Path:
     """Find newest usage CSV file whose name starts with usage_prefix."""
     if not inputs_dir.exists() or not inputs_dir.is_dir():
@@ -738,32 +762,16 @@ def generate_master_billing_report(
     """Create a three-tab master billing dashboard workbook with audit controls."""
     data = df_usage.copy()
 
-    if "PARTNER_NAME" not in data.columns:
-        data["PARTNER_NAME"] = ""
-    if "PARTNER_ID" not in data.columns:
-        data["PARTNER_ID"] = ""
-    if "row_type" not in data.columns:
-        data["row_type"] = ""
-    if "ER_ID" not in data.columns:
-        data["ER_ID"] = ""
-    if "ER_NAME" not in data.columns:
-        data["ER_NAME"] = ""
-    if "TOTAL_INDIVIDUAL_USERS" not in data.columns:
-        data["TOTAL_INDIVIDUAL_USERS"] = 0
-    if "user_fee_units_charged" not in data.columns:
-        data["user_fee_units_charged"] = 0
-    if "er_fee" not in data.columns:
-        data["er_fee"] = 0
-    if "iu_fee" not in data.columns:
-        data["iu_fee"] = 0
-    if "next_day_er_fee" not in data.columns:
-        data["next_day_er_fee"] = 0
-    if "next_day_iu_fee" not in data.columns:
-        data["next_day_iu_fee"] = 0
-    if "total_fee" not in data.columns:
-        data["total_fee"] = 0
-    if "fee_calc_status" not in data.columns:
-        data["fee_calc_status"] = ""
+    _report_col_defaults: Dict[str, Any] = {
+        "PARTNER_NAME": "", "PARTNER_ID": "", "row_type": "",
+        "ER_ID": "", "ER_NAME": "", "fee_calc_status": "",
+        "TOTAL_INDIVIDUAL_USERS": 0, "user_fee_units_charged": 0,
+        "er_fee": 0, "iu_fee": 0, "next_day_er_fee": 0,
+        "next_day_iu_fee": 0, "total_fee": 0,
+    }
+    for col, default in _report_col_defaults.items():
+        if col not in data.columns:
+            data[col] = default
 
     data["_partner_name"] = data["PARTNER_NAME"].apply(key)
     fallback_partner_id = data["PARTNER_ID"].apply(key)
@@ -969,6 +977,302 @@ def generate_master_billing_report(
         ws_source.freeze_panes(1, 0)
 
 
+def _build_partner_lookups(
+    mapping_df: pd.DataFrame,
+    config_df: pd.DataFrame,
+    minimums_df: pd.DataFrame,
+    pricing_df: pd.DataFrame,
+    usage_rows: List[Dict[str, Any]],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Build all partner lookup structures from rules workbook sheets.
+
+    Returns a dict with keys:
+      ns_map_by_clean_id, ns_map_by_name, ns_map_by_partner_key,
+      cfg_by_partner, min_sched_by_partner,
+      tiers_by_partner, partner_tier_mode, partner_metric_by_partner,
+      all_in_tier_by_partner, split_tiers_by_partner,
+      total_metric_units_by_partner.
+    """
+    ns_map_by_clean_id: Dict[str, str] = {}
+    ns_map_by_name: Dict[str, str] = {}
+    ns_map_by_partner_key: Dict[str, str] = {}
+    for row in mapping_df.to_dict(orient="records"):
+        partner_id = key(row.get("partner_id"))
+        partner_name = lower_key(row.get("partner_name"))
+        customer_name = key(
+            value_from_aliases(row, ["ns_customer_name", "netsuite_customer_name", "customer_name"])
+        )
+        if not customer_name:
+            continue
+        cleaned = clean_id(partner_id)
+        if cleaned:
+            ns_map_by_clean_id[cleaned] = customer_name
+        if partner_name:
+            ns_map_by_name[partner_name] = customer_name
+        p_key = pricing_partner_key(row)
+        if p_key:
+            ns_map_by_partner_key[p_key] = customer_name
+
+    cfg_by_partner: Dict[str, Dict[str, Optional[date]]] = {}
+    for row in config_df.to_dict(orient="records"):
+        p_key = pricing_partner_key(row)
+        if not p_key:
+            continue
+        cfg_by_partner[p_key] = {
+            "min_start": parse_date(
+                value_from_aliases(
+                    row,
+                    ["minimums_start_month", "minimum_start_month", "min_start_month", "min_start"],
+                )
+            ),
+            "min_end": parse_date(
+                value_from_aliases(
+                    row,
+                    ["minimums_end_month", "minimum_end_month", "min_end_month", "min_end"],
+                )
+            ),
+        }
+
+    min_sched_by_partner: Dict[str, List[Dict[str, float]]] = {}
+    for row in minimums_df.to_dict(orient="records"):
+        p_key = pricing_partner_key(row)
+        if not p_key:
+            continue
+        min_sched_by_partner.setdefault(p_key, []).append(
+            {
+                "start": num(value_from_aliases(row, ["month_start", "start_month", "min_month_start"])),
+                "end": num(value_from_aliases(row, ["month_end", "end_month", "min_month_end"])),
+                "amount": num(value_from_aliases(row, ["minimum_amount", "amount", "minimum"])),
+            }
+        )
+    for p_key in min_sched_by_partner:
+        min_sched_by_partner[p_key].sort(key=lambda r: r["start"])
+
+    if "tier_type" not in pricing_df.columns:
+        pricing_df["tier_type"] = "ALL_IN"
+    pricing_df["tier_type"] = pricing_df["tier_type"].fillna("").astype(str).str.strip()
+    pricing_df.loc[pricing_df["tier_type"] == "", "tier_type"] = "ALL_IN"
+    pricing_df["tier_type"] = pricing_df["tier_type"].str.upper()
+
+    tiers_by_partner: Dict[str, List[Tier]] = {}
+    for row in pricing_df.to_dict(orient="records"):
+        p_key = pricing_partner_key(row)
+        if not p_key:
+            continue
+        end_value = value_from_aliases(row, ["tierend", "tier_end", "end"])
+        if is_missing(end_value) or key(end_value) == "":
+            tier_end = float("inf")
+        else:
+            tier_end = num(end_value)
+        tier_type_value = key(row.get("tier_type")).upper() or "ALL_IN"
+        if tier_type_value not in {"ALL_IN", "SPLIT"}:
+            tier_type_value = "ALL_IN"
+        tier = Tier(
+            metric=metric_norm(value_from_aliases(row, ["tier_metric", "metric"])),
+            start=num(value_from_aliases(row, ["tierstart", "tier_start", "start"])),
+            end=tier_end,
+            company_fee=num(value_from_aliases(row, ["er_fee", "company_fee", "unit_price_er"])),
+            user_fee=num(value_from_aliases(row, ["iu_fee", "user_fee", "unit_price_iu"])),
+            included=1
+            if num(value_from_aliases(row, ["include_iu", "included_users_in_company_fee", "included"])) > 0
+            else 0,
+            tier_type=tier_type_value,
+            unit_price_next_day_er=num(value_from_aliases(row, ["unit_price_next_day_er", "next_day_fee_er"])),
+            unit_price_next_day_iu=num(value_from_aliases(row, ["unit_price_next_day_iu", "next_day_fee_iu"])),
+        )
+        tiers_by_partner.setdefault(p_key, []).append(tier)
+    for p_key in tiers_by_partner:
+        tiers_by_partner[p_key].sort(key=lambda t: t.start)
+
+    partner_tier_mode: Dict[str, str] = {}
+    partner_metric_by_partner: Dict[str, str] = {}
+    for p_key, partner_tiers in tiers_by_partner.items():
+        tier_types = {tier.tier_type for tier in partner_tiers}
+        if len(tier_types) > 1:
+            logger.warning(
+                "Partner '%s' has mixed tier_type values %s. SPLIT takes precedence.",
+                p_key,
+                sorted(tier_types),
+            )
+        partner_tier_mode[p_key] = "SPLIT" if "SPLIT" in tier_types else "ALL_IN"
+
+        metric_candidates = [tier.metric for tier in partner_tiers if tier.metric in {"IU", "ER", "FLAT"}]
+        if not metric_candidates:
+            partner_metric_by_partner[p_key] = "FLAT"
+        else:
+            chosen_metric = metric_candidates[0]
+            if len(set(metric_candidates)) > 1:
+                logger.warning(
+                    "Partner '%s' has mixed tier metrics %s. Using '%s'.",
+                    p_key,
+                    sorted(set(metric_candidates)),
+                    chosen_metric,
+                )
+            partner_metric_by_partner[p_key] = chosen_metric
+
+    all_in_tier_by_partner: Dict[str, Optional[Tier]] = {}
+    split_tiers_by_partner: Dict[str, List[Tier]] = {}
+    total_metric_units_by_partner: Dict[str, float] = {}
+    seen_er_for_total: Dict[str, set[str]] = {}
+    for p_key, partner_tiers in tiers_by_partner.items():
+        metric = partner_metric_by_partner.get(p_key, "FLAT")
+        metric_tiers = [tier for tier in partner_tiers if tier.metric == metric]
+        if not metric_tiers:
+            metric_tiers = partner_tiers
+
+        split_tiers = [tier for tier in metric_tiers if tier.tier_type == "SPLIT"]
+        all_in_tiers = [tier for tier in metric_tiers if tier.tier_type == "ALL_IN"]
+        if not split_tiers:
+            split_tiers = metric_tiers
+        if not all_in_tiers:
+            all_in_tiers = metric_tiers
+        split_tiers_by_partner[p_key] = split_tiers
+        total_metric_units_by_partner[p_key] = 0.0
+        seen_er_for_total[p_key] = set()
+        total_units = 0.0
+        for usage_row in usage_rows:
+            row_partner = usage_partner_key(usage_row)
+            row_company = usage_company_key(usage_row)
+            if row_partner != p_key or not row_company:
+                continue
+            if metric == "IU":
+                total_units += max(num(usage_row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+            elif metric == "ER":
+                if row_company not in seen_er_for_total[p_key]:
+                    seen_er_for_total[p_key].add(row_company)
+                    total_units += 1.0
+            else:  # FLAT
+                total_units += 1.0
+        total_metric_units_by_partner[p_key] = total_units
+        all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
+
+    return {
+        "ns_map_by_clean_id": ns_map_by_clean_id,
+        "ns_map_by_name": ns_map_by_name,
+        "ns_map_by_partner_key": ns_map_by_partner_key,
+        "cfg_by_partner": cfg_by_partner,
+        "min_sched_by_partner": min_sched_by_partner,
+        "tiers_by_partner": tiers_by_partner,
+        "partner_tier_mode": partner_tier_mode,
+        "partner_metric_by_partner": partner_metric_by_partner,
+        "all_in_tier_by_partner": all_in_tier_by_partner,
+        "split_tiers_by_partner": split_tiers_by_partner,
+        "total_metric_units_by_partner": total_metric_units_by_partner,
+    }
+
+
+def _write_partner_detail_files(
+    master_df: pd.DataFrame,
+    partner_dir: Path,
+    for_month_any: date,
+    usage_source_columns: List[str],
+    logger: logging.Logger,
+) -> None:
+    """Write per-partner detail Excel files into partner_dir sub-folders."""
+    if "PARTNER_NAME" not in master_df.columns:
+        raise BillingEngineError("PARTNER_NAME column missing from output data.")
+    if "FOR_MONTH" not in master_df.columns:
+        raise BillingEngineError("FOR_MONTH column missing from output data.")
+
+    for partner_name, group in master_df.groupby("PARTNER_NAME", dropna=False):
+        group_partner_name = key(partner_name)
+        if not group_partner_name:
+            partner_id = key(group["PARTNER_ID"].iloc[0]) if "PARTNER_ID" in group.columns else ""
+            group_partner_name = partner_id or "UnknownPartner"
+
+        for_month_candidates = [v for v in group["FOR_MONTH"].tolist() if key(v)]
+        month_source = for_month_candidates[0] if for_month_candidates else ""
+        parsed_month = parse_date(month_source) or for_month_any
+        year_month = f"{parsed_month.year:04d}.{parsed_month.month:02d}"
+
+        partner_folder = sanitize_partner_name(group_partner_name)
+        partner_folder_path = partner_dir / partner_folder
+        partner_folder_path.mkdir(parents=True, exist_ok=True)
+
+        partner_display = safe_partner_display_name(group_partner_name)
+        file_name = f"{partner_display} - {year_month}.xlsx"
+        file_path = partner_folder_path / file_name
+
+        has_next_day_fees = False
+        if "next_day_er_fee" in group.columns and "next_day_iu_fee" in group.columns:
+            next_day_total = (
+                pd.to_numeric(group["next_day_er_fee"], errors="coerce").fillna(0).sum()
+                + pd.to_numeric(group["next_day_iu_fee"], errors="coerce").fillna(0).sum()
+            )
+            has_next_day_fees = next_day_total > 0
+
+        has_mrb = False
+        if "IS_MRB" in group.columns:
+            mrb_values = (
+                group["IS_MRB"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            has_mrb = mrb_values.isin({"yes", "true", "1"}).any()
+
+        base_columns: List[str] = []
+        for col in usage_source_columns:
+            if col == "CURRENT_ACH_SPEED":
+                if has_next_day_fees:
+                    base_columns.append(col)
+                continue
+            if col in {"IS_MRB", "MRB_BILLING_ANNIVERSARY"}:
+                if has_mrb:
+                    base_columns.append(col)
+                continue
+            base_columns.append(col)
+
+        detail_columns: List[str] = []
+        for col in base_columns + PARTNER_DETAIL_CALC_COLUMNS:
+            if col not in detail_columns:
+                detail_columns.append(col)
+        if has_next_day_fees:
+            for col in ["next_day_er_fee", "unit_price_next_day_iu", "next_day_iu_fee"]:
+                if col not in detail_columns:
+                    detail_columns.append(col)
+        if "total_fee" in detail_columns:
+            detail_columns = [col for col in detail_columns if col != "total_fee"] + ["total_fee"]
+
+        detail_df = group.copy()
+        for col in detail_columns:
+            if col not in detail_df.columns:
+                detail_df[col] = ""
+        detail_df = detail_df.loc[:, detail_columns]
+
+        for col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+            if col_name in detail_df.columns:
+                detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
+
+        financial_columns = set(PARTNER_DETAIL_FINANCIAL_COLUMNS)
+        if has_next_day_fees:
+            financial_columns.update({"unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"})
+        for col_name in financial_columns:
+            if col_name in detail_df.columns:
+                detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
+
+        with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+            sheet_name = "Partner Detail"
+            detail_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+            workbook = writer.book
+            worksheet = writer.sheets[sheet_name]
+            fmt_int = workbook.add_format({"num_format": "0"})
+            fmt_money = workbook.add_format({"num_format": "#,##0.00"})
+
+            for col_idx, col_name in enumerate(detail_df.columns):
+                col_fmt = None
+                if col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+                    col_fmt = fmt_int
+                elif col_name in financial_columns:
+                    col_fmt = fmt_money
+                worksheet.set_column(col_idx, col_idx, 18, col_fmt)
+
+        logger.info("Wrote partner detail file: %s", file_path)
+
+
 def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
     """Main workflow execution."""
     run_started_at = datetime.now(timezone.utc).replace(microsecond=0)
@@ -1038,171 +1342,19 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
 
     usage_rows = canonicalize_usage_rows(usage_df)
 
-    # Build NetSuite name mappings by cleaned partner_id and partner_name.
-    ns_map_by_clean_id: Dict[str, str] = {}
-    ns_map_by_name: Dict[str, str] = {}
-    ns_map_by_partner_key: Dict[str, str] = {}
-    for row in mapping_df.to_dict(orient="records"):
-        partner_id = key(row.get("partner_id"))
-        partner_name = lower_key(row.get("partner_name"))
-        customer_name = key(
-            value_from_aliases(row, ["ns_customer_name", "netsuite_customer_name", "customer_name"])
-        )
-        if not customer_name:
-            continue
-        cleaned = clean_id(partner_id)
-        if cleaned:
-            ns_map_by_clean_id[cleaned] = customer_name
-        if partner_name:
-            ns_map_by_name[partner_name] = customer_name
-        p_key = pricing_partner_key(row)
-        if p_key:
-            ns_map_by_partner_key[p_key] = customer_name
-
-    # Build config and minimum schedules.
-    cfg_by_partner: Dict[str, Dict[str, Optional[date]]] = {}
-    for row in config_df.to_dict(orient="records"):
-        p_key = pricing_partner_key(row)
-        if not p_key:
-            continue
-        cfg_by_partner[p_key] = {
-            "min_start": parse_date(
-                value_from_aliases(
-                    row,
-                    ["minimums_start_month", "minimum_start_month", "min_start_month", "min_start"],
-                )
-            ),
-            "min_end": parse_date(
-                value_from_aliases(
-                    row,
-                    ["minimums_end_month", "minimum_end_month", "min_end_month", "min_end"],
-                )
-            ),
-        }
-
-    min_sched_by_partner: Dict[str, List[Dict[str, float]]] = {}
-    for row in minimums_df.to_dict(orient="records"):
-        p_key = pricing_partner_key(row)
-        if not p_key:
-            continue
-        min_sched_by_partner.setdefault(p_key, []).append(
-            {
-                "start": num(value_from_aliases(row, ["month_start", "start_month", "min_month_start"])),
-                "end": num(value_from_aliases(row, ["month_end", "end_month", "min_month_end"])),
-                "amount": num(value_from_aliases(row, ["minimum_amount", "amount", "minimum"])),
-            }
-        )
-    for p_key in min_sched_by_partner:
-        min_sched_by_partner[p_key].sort(key=lambda r: r["start"])
-
-    # Build tier rules by partner and normalize tier mode.
-    if "tier_type" not in pricing_df.columns:
-        pricing_df["tier_type"] = "ALL_IN"
-    pricing_df["tier_type"] = pricing_df["tier_type"].fillna("").astype(str).str.strip()
-    pricing_df.loc[pricing_df["tier_type"] == "", "tier_type"] = "ALL_IN"
-    pricing_df["tier_type"] = pricing_df["tier_type"].str.upper()
-
-    tiers_by_partner: Dict[str, List[Tier]] = {}
-    for row in pricing_df.to_dict(orient="records"):
-        p_key = pricing_partner_key(row)
-        if not p_key:
-            continue
-        end_value = value_from_aliases(row, ["tierend", "tier_end", "end"])
-        if is_missing(end_value) or key(end_value) == "":
-            tier_end = float("inf")
-        else:
-            tier_end = num(end_value)
-        tier_type_value = key(row.get("tier_type")).upper() or "ALL_IN"
-        if tier_type_value not in {"ALL_IN", "SPLIT"}:
-            tier_type_value = "ALL_IN"
-        tier = Tier(
-            metric=metric_norm(value_from_aliases(row, ["tier_metric", "metric"])),
-            start=num(value_from_aliases(row, ["tierstart", "tier_start", "start"])),
-            end=tier_end,
-            company_fee=num(value_from_aliases(row, ["er_fee", "company_fee", "unit_price_er"])),
-            user_fee=num(value_from_aliases(row, ["iu_fee", "user_fee", "unit_price_iu"])),
-            included=1
-            if num(value_from_aliases(row, ["include_iu", "included_users_in_company_fee", "included"])) > 0
-            else 0,
-            tier_type=tier_type_value,
-            unit_price_next_day_er=num(value_from_aliases(row, ["unit_price_next_day_er", "next_day_fee_er"])),
-            unit_price_next_day_iu=num(value_from_aliases(row, ["unit_price_next_day_iu", "next_day_fee_iu"])),
-        )
-        tiers_by_partner.setdefault(p_key, []).append(tier)
-    for p_key in tiers_by_partner:
-        tiers_by_partner[p_key].sort(key=lambda t: t.start)
-
-    partner_tier_mode: Dict[str, str] = {}
-    partner_metric_by_partner: Dict[str, str] = {}
-    for p_key, partner_tiers in tiers_by_partner.items():
-        tier_types = {tier.tier_type for tier in partner_tiers}
-        if len(tier_types) > 1:
-            logger.warning(
-                "Partner '%s' has mixed tier_type values %s. SPLIT takes precedence.",
-                p_key,
-                sorted(tier_types),
-            )
-        partner_tier_mode[p_key] = "SPLIT" if "SPLIT" in tier_types else "ALL_IN"
-
-        metric_candidates = [tier.metric for tier in partner_tiers if tier.metric in {"IU", "ER", "FLAT"}]
-        if not metric_candidates:
-            partner_metric_by_partner[p_key] = "FLAT"
-        else:
-            chosen_metric = metric_candidates[0]
-            if len(set(metric_candidates)) > 1:
-                logger.warning(
-                    "Partner '%s' has mixed tier metrics %s. Using '%s'.",
-                    p_key,
-                    sorted(set(metric_candidates)),
-                    chosen_metric,
-                )
-            partner_metric_by_partner[p_key] = chosen_metric
-
-    def select_tier_for_value(tiers: List[Tier], value: float) -> Optional[Tier]:
-        if not tiers:
-            return None
-        matched = [tier for tier in tiers if tier.start <= value <= tier.end]
-        if matched:
-            return max(matched, key=lambda tier: tier.start)
-        if value < min(tier.start for tier in tiers):
-            return min(tiers, key=lambda tier: tier.start)
-        return max(tiers, key=lambda tier: tier.start)
-
-    all_in_tier_by_partner: Dict[str, Optional[Tier]] = {}
-    split_tiers_by_partner: Dict[str, List[Tier]] = {}
-    total_metric_units_by_partner: Dict[str, float] = {}
-    seen_er_for_total: Dict[str, set[str]] = {}
-    for p_key, partner_tiers in tiers_by_partner.items():
-        metric = partner_metric_by_partner.get(p_key, "FLAT")
-        metric_tiers = [tier for tier in partner_tiers if tier.metric == metric]
-        if not metric_tiers:
-            metric_tiers = partner_tiers
-
-        split_tiers = [tier for tier in metric_tiers if tier.tier_type == "SPLIT"]
-        all_in_tiers = [tier for tier in metric_tiers if tier.tier_type == "ALL_IN"]
-        if not split_tiers:
-            split_tiers = metric_tiers
-        if not all_in_tiers:
-            all_in_tiers = metric_tiers
-        split_tiers_by_partner[p_key] = split_tiers
-        total_metric_units_by_partner[p_key] = 0.0
-        seen_er_for_total[p_key] = set()
-        total_units = 0.0
-        for usage_row in usage_rows:
-            row_partner = usage_partner_key(usage_row)
-            row_company = usage_company_key(usage_row)
-            if row_partner != p_key or not row_company:
-                continue
-            if metric == "IU":
-                total_units += max(num(usage_row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
-            elif metric == "ER":
-                if row_company not in seen_er_for_total[p_key]:
-                    seen_er_for_total[p_key].add(row_company)
-                    total_units += 1.0
-            else:  # FLAT
-                total_units += 1.0
-        total_metric_units_by_partner[p_key] = total_units
-        all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
+    logger.info("Building partner lookups...")
+    lookups = _build_partner_lookups(mapping_df, config_df, minimums_df, pricing_df, usage_rows, logger)
+    ns_map_by_clean_id = lookups["ns_map_by_clean_id"]
+    ns_map_by_name = lookups["ns_map_by_name"]
+    ns_map_by_partner_key = lookups["ns_map_by_partner_key"]
+    cfg_by_partner = lookups["cfg_by_partner"]
+    min_sched_by_partner = lookups["min_sched_by_partner"]
+    tiers_by_partner = lookups["tiers_by_partner"]
+    partner_tier_mode = lookups["partner_tier_mode"]
+    partner_metric_by_partner = lookups["partner_metric_by_partner"]
+    all_in_tier_by_partner = lookups["all_in_tier_by_partner"]
+    split_tiers_by_partner = lookups["split_tiers_by_partner"]
+    total_metric_units_by_partner = lookups["total_metric_units_by_partner"]
 
     # FOR_MONTH is required by the workflow logic.
     first_usage = usage_rows[0]
@@ -1221,6 +1373,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     split_seen_er: Dict[str, set[str]] = {}
     out_rows: List[Dict[str, Any]] = []
     partner_totals: Dict[str, float] = {}
+    _warned_ns_unmapped: set[str] = set()
 
     def lookup_netsuite_name(partner_id_raw: Any, partner_name_raw: Any, p_key: str) -> str:
         cleaned = clean_id(partner_id_raw)
@@ -1255,31 +1408,22 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         row["netsuite_customer_name"] = lookup_netsuite_name(
             partner_id_raw, partner_name_raw, p_key
         )
+        if not row["netsuite_customer_name"] and p_key and p_key not in _warned_ns_unmapped:
+            _warned_ns_unmapped.add(p_key)
+            logger.warning(
+                "No NetSuite customer name mapping found for partner_id='%s' partner_name='%s'",
+                key(partner_id_raw),
+                key(partner_name_raw),
+            )
 
         if not p_key or not c_key:
-            row["fee_calc_status"] = "bad_data"
-            row["row_type"] = "usage"
-            row["company_fee_units_charged"] = 0
-            row["user_fee_units_charged"] = 0
-            row["unit_price_er"] = 0.0
-            row["unit_price_iu"] = 0.0
-            row["er_fee"] = 0.0
-            row["iu_fee"] = 0.0
-            row["total_fee"] = 0.0
+            _mark_row_no_fee(row, "bad_data")
             out_rows.append(row)
             continue
 
         tiers = tiers_by_partner.get(p_key, [])
         if not tiers:
-            row["fee_calc_status"] = "missing_tier"
-            row["row_type"] = "usage"
-            row["company_fee_units_charged"] = 0
-            row["user_fee_units_charged"] = 0
-            row["unit_price_er"] = 0.0
-            row["unit_price_iu"] = 0.0
-            row["er_fee"] = 0.0
-            row["iu_fee"] = 0.0
-            row["total_fee"] = 0.0
+            _mark_row_no_fee(row, "missing_tier")
             out_rows.append(row)
             continue
 
@@ -1314,15 +1458,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
                 selected_tier = select_tier_for_value(tiers, tier_value)
 
         if selected_tier is None:
-            row["fee_calc_status"] = "missing_tier"
-            row["row_type"] = "usage"
-            row["company_fee_units_charged"] = 0
-            row["user_fee_units_charged"] = 0
-            row["unit_price_er"] = 0.0
-            row["unit_price_iu"] = 0.0
-            row["er_fee"] = 0.0
-            row["iu_fee"] = 0.0
-            row["total_fee"] = 0.0
+            _mark_row_no_fee(row, "missing_tier")
             out_rows.append(row)
             continue
 
@@ -1535,109 +1671,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     generate_master_billing_report(master_df, netsuite_df, input_metrics, history_file_path)
     logger.info("Wrote master billing report: %s", history_file_path)
 
-    # Partner split files.
-    if "PARTNER_NAME" not in master_df.columns:
-        raise BillingEngineError("PARTNER_NAME column missing from output data.")
-    if "FOR_MONTH" not in master_df.columns:
-        raise BillingEngineError("FOR_MONTH column missing from output data.")
-
-    for partner_name, group in master_df.groupby("PARTNER_NAME", dropna=False):
-        group_partner_name = key(partner_name)
-        if not group_partner_name:
-            partner_id = key(group["PARTNER_ID"].iloc[0]) if "PARTNER_ID" in group.columns else ""
-            group_partner_name = partner_id or "UnknownPartner"
-
-        for_month_candidates = [v for v in group["FOR_MONTH"].tolist() if key(v)]
-        month_source = for_month_candidates[0] if for_month_candidates else ""
-        parsed_month = parse_date(month_source) or for_month_any
-        year_month = f"{parsed_month.year:04d}.{parsed_month.month:02d}"
-
-        partner_folder = sanitize_partner_name(group_partner_name)
-        partner_folder_path = partner_dir / partner_folder
-        os.makedirs(partner_folder_path, exist_ok=True)
-
-        partner_display = safe_partner_display_name(group_partner_name)
-        file_name = f"{partner_display} - {year_month}.xlsx"
-        file_path = partner_folder_path / file_name
-
-        has_next_day_fees = False
-        if "next_day_er_fee" in group.columns and "next_day_iu_fee" in group.columns:
-            next_day_total = (
-                pd.to_numeric(group["next_day_er_fee"], errors="coerce").fillna(0).sum()
-                + pd.to_numeric(group["next_day_iu_fee"], errors="coerce").fillna(0).sum()
-            )
-            has_next_day_fees = next_day_total > 0
-
-        has_mrb = False
-        if "IS_MRB" in group.columns:
-            mrb_values = (
-                group["IS_MRB"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .str.lower()
-            )
-            has_mrb = mrb_values.isin({"yes", "true", "1"}).any()
-
-        base_columns: List[str] = []
-        for col in usage_source_columns:
-            if col == "CURRENT_ACH_SPEED":
-                if has_next_day_fees:
-                    base_columns.append(col)
-                continue
-            if col in {"IS_MRB", "MRB_BILLING_ANNIVERSARY"}:
-                if has_mrb:
-                    base_columns.append(col)
-                continue
-            base_columns.append(col)
-
-        detail_columns: List[str] = []
-        for col in base_columns + PARTNER_DETAIL_CALC_COLUMNS:
-            if col not in detail_columns:
-                detail_columns.append(col)
-        if has_next_day_fees:
-            for col in ["next_day_er_fee", "unit_price_next_day_iu", "next_day_iu_fee"]:
-                if col not in detail_columns:
-                    detail_columns.append(col)
-        if "total_fee" in detail_columns:
-            detail_columns = [col for col in detail_columns if col != "total_fee"] + ["total_fee"]
-
-        detail_df = group.copy()
-        for col in detail_columns:
-            if col not in detail_df.columns:
-                detail_df[col] = ""
-        detail_df = detail_df.loc[:, detail_columns]
-
-        # Normalize known numeric output columns before applying Excel formats.
-        for col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
-            if col_name in detail_df.columns:
-                detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
-
-        financial_columns = set(PARTNER_DETAIL_FINANCIAL_COLUMNS)
-        if has_next_day_fees:
-            financial_columns.update({"unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"})
-        for col_name in financial_columns:
-            if col_name in detail_df.columns:
-                detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
-
-        with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
-            sheet_name = "Partner Detail"
-            detail_df.to_excel(writer, index=False, sheet_name=sheet_name)
-
-            workbook = writer.book
-            worksheet = writer.sheets[sheet_name]
-            fmt_int = workbook.add_format({"num_format": "0"})
-            fmt_money = workbook.add_format({"num_format": "#,##0.00"})
-
-            for col_idx, col_name in enumerate(detail_df.columns):
-                col_fmt = None
-                if col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
-                    col_fmt = fmt_int
-                elif col_name in financial_columns:
-                    col_fmt = fmt_money
-                worksheet.set_column(col_idx, col_idx, 18, col_fmt)
-
-        logger.info("Wrote partner detail file: %s", file_path)
+    _write_partner_detail_files(master_df, partner_dir, for_month_any, usage_source_columns, logger)
 
     manifest = {
         "run_id": run_id,
