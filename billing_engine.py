@@ -553,8 +553,8 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
         "iu_fee",
         "total_fee",
         "user_fee_units_charged",
-        "unit_price_er",
-        "unit_price_iu",
+        "next_day_er_fee",
+        "next_day_iu_fee",
     }
     missing = sorted(col for col in required if col not in df_usage.columns)
     if missing:
@@ -570,43 +570,9 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
         "Item",
         "Description",
         "Quantity",
-        "Unit Price",
         "Amount",
         "Product",
     ]
-
-    # Customer-level unit price audit warnings.
-    usage_mask_all = df_usage["row_type"].fillna("").astype(str).str.lower() == "usage"
-    usage_all = df_usage.loc[usage_mask_all].copy()
-    for customer_name, cust_group in usage_all.groupby("netsuite_customer_name", dropna=False):
-        er_prices = sorted(
-            set(
-                float(v)
-                for v in pd.to_numeric(cust_group["unit_price_er"], errors="coerce")
-                .dropna()
-                .tolist()
-            )
-        )
-        iu_prices = sorted(
-            set(
-                float(v)
-                for v in pd.to_numeric(cust_group["unit_price_iu"], errors="coerce")
-                .dropna()
-                .tolist()
-            )
-        )
-        if len(er_prices) > 1:
-            logger.warning(
-                "Unit price check warning for customer '%s': multiple unit_price_er values %s",
-                key(customer_name),
-                er_prices,
-            )
-        if len(iu_prices) > 1:
-            logger.warning(
-                "Unit price check warning for customer '%s': multiple unit_price_iu values %s",
-                key(customer_name),
-                iu_prices,
-            )
 
     rows: List[Dict[str, Any]] = []
     grouped = df_usage.groupby(["netsuite_customer_name", "FOR_MONTH", "PARTNER_ID"], dropna=False)
@@ -652,22 +618,6 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
             end_users_amount = round2(
                 pd.to_numeric(usage_group["er_fee"], errors="coerce").fillna(0).sum()
             )
-            end_users_unit_price = round2(end_users_amount / end_user_quantity) if end_user_quantity else 0.0
-
-            er_unit_prices = sorted(
-                set(
-                    float(v)
-                    for v in pd.to_numeric(usage_group["unit_price_er"], errors="coerce")
-                    .dropna()
-                    .tolist()
-                )
-            )
-            if len(er_unit_prices) > 1:
-                logger.warning(
-                    "Unit price check warning for invoice '%s': multiple unit_price_er values %s",
-                    invoice_external_id,
-                    er_unit_prices,
-                )
 
             rows.append(
                 {
@@ -676,9 +626,8 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Memo": memo,
                     "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
                     "Item": "Embedded Payroll",
-                    "Description": "End Users",
-                    "Quantity": end_user_quantity,
-                    "Unit Price": end_users_unit_price,
+                    "Description": f"End Users - {end_user_quantity} total (See attached Partner Detail Report for fee breakdown)",
+                    "Quantity": 1,
                     "Amount": end_users_amount,
                     "Product": "GEP Usage",
                 }
@@ -692,9 +641,6 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
             individual_users_amount = round2(
                 pd.to_numeric(usage_group["iu_fee"], errors="coerce").fillna(0).sum()
             )
-            individual_unit_price = (
-                round2(individual_users_amount / individual_quantity) if individual_quantity else 0.0
-            )
 
             rows.append(
                 {
@@ -703,14 +649,68 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Memo": memo,
                     "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
                     "Item": "Embedded Payroll",
-                    "Description": "Individual Users",
-                    "Quantity": individual_quantity,
-                    "Unit Price": individual_unit_price,
+                    "Description": f"Individual Users - {individual_quantity} total (See attached Partner Detail Report for fee breakdown)",
+                    "Quantity": 1,
                     "Amount": individual_users_amount,
                     "Product": "GEP Usage",
                 }
             )
             line_amounts.append(individual_users_amount)
+
+            # Line D - Next-Day ACH End Users.
+            nd_er_amount = round2(
+                pd.to_numeric(usage_group["next_day_er_fee"], errors="coerce").fillna(0).sum()
+            )
+            if nd_er_amount > 0:
+                nd_er_keys: set[str] = set()
+                for _, nd_row in usage_group.iterrows():
+                    if float(pd.to_numeric(nd_row.get("next_day_er_fee", 0), errors="coerce") or 0) > 0:
+                        nd_er_id = key(nd_row.get("ER_ID"))
+                        if nd_er_id:
+                            nd_er_keys.add(f"id:{nd_er_id}")
+                        else:
+                            nd_er_name = lower_key(nd_row.get("ER_NAME"))
+                            if nd_er_name:
+                                nd_er_keys.add(f"name:{nd_er_name}")
+                nd_er_count = len(nd_er_keys)
+                rows.append(
+                    {
+                        "Customer": key(customer_name),
+                        "Invoice External ID": invoice_external_id,
+                        "Memo": memo,
+                        "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                        "Item": "Embedded Payroll : Next-Day Direct Deposit",
+                        "Description": f"End Users - {nd_er_count} total (See attached Partner Detail Report for fee breakdown)",
+                        "Quantity": 1,
+                        "Amount": nd_er_amount,
+                        "Product": "GEP Next-Day Direct Deposit",
+                    }
+                )
+                line_amounts.append(nd_er_amount)
+
+            # Line E - Next-Day ACH Individual Users.
+            nd_iu_amount = round2(
+                pd.to_numeric(usage_group["next_day_iu_fee"], errors="coerce").fillna(0).sum()
+            )
+            if nd_iu_amount > 0:
+                nd_iu_mask = pd.to_numeric(usage_group["next_day_iu_fee"], errors="coerce").fillna(0) > 0
+                nd_iu_count = round2(
+                    pd.to_numeric(usage_group.loc[nd_iu_mask, "user_fee_units_charged"], errors="coerce").fillna(0).sum()
+                )
+                rows.append(
+                    {
+                        "Customer": key(customer_name),
+                        "Invoice External ID": invoice_external_id,
+                        "Memo": memo,
+                        "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
+                        "Item": "Embedded Payroll : Next-Day Direct Deposit",
+                        "Description": f"Individual Users - {nd_iu_count} total (See attached Partner Detail Report for fee breakdown)",
+                        "Quantity": 1,
+                        "Amount": nd_iu_amount,
+                        "Product": "GEP Next-Day Direct Deposit",
+                    }
+                )
+                line_amounts.append(nd_iu_amount)
 
         # Line C - Minimum True-up.
         if not min_group.empty:
@@ -726,7 +726,6 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Item": "Embedded Payroll : Monthly Minimum",
                     "Description": "Minimum True-up",
                     "Quantity": 1,
-                    "Unit Price": "",
                     "Amount": minimum_trueup_amount,
                     "Product": "GEP Minimums",
                 }
@@ -736,6 +735,8 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
         input_total = round2(
             pd.to_numeric(usage_group["er_fee"], errors="coerce").fillna(0).sum()
             + pd.to_numeric(usage_group["iu_fee"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(usage_group["next_day_er_fee"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(usage_group["next_day_iu_fee"], errors="coerce").fillna(0).sum()
             + pd.to_numeric(min_group["total_fee"], errors="coerce").fillna(0).sum()
         )
         output_total = round2(sum(line_amounts))
