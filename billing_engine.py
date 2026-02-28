@@ -1157,7 +1157,10 @@ def _build_partner_lookups(
             )
         partner_tier_mode[p_key] = "SPLIT" if "SPLIT" in tier_types else "ALL_IN"
 
-        metric_candidates = [tier.metric for tier in partner_tiers if tier.metric in {"IU", "ER", "FLAT"}]
+        metric_candidates = [
+            tier.metric for tier in partner_tiers
+            if tier.metric in {"IU", "ER", "FLAT", "IU_PER_ER"}
+        ]
         if not metric_candidates:
             partner_metric_by_partner[p_key] = "FLAT"
         else:
@@ -1191,21 +1194,25 @@ def _build_partner_lookups(
         total_metric_units_by_partner[p_key] = 0.0
         seen_er_for_total[p_key] = set()
         total_units = 0.0
-        for usage_row in usage_rows:
-            row_partner = usage_partner_key(usage_row)
-            row_company = usage_company_key(usage_row)
-            if row_partner != p_key or not row_company:
-                continue
-            if metric == "IU":
-                total_units += max(num(usage_row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
-            elif metric == "ER":
-                if row_company not in seen_er_for_total[p_key]:
-                    seen_er_for_total[p_key].add(row_company)
+        if metric == "IU_PER_ER":
+            # Tier selection is per-row from TOTAL_INDIVIDUAL_USERS (IUs per ER); no single partner total.
+            all_in_tier_by_partner[p_key] = None
+        else:
+            for usage_row in usage_rows:
+                row_partner = usage_partner_key(usage_row)
+                row_company = usage_company_key(usage_row)
+                if row_partner != p_key or not row_company:
+                    continue
+                if metric == "IU":
+                    total_units += max(num(usage_row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+                elif metric == "ER":
+                    if row_company not in seen_er_for_total[p_key]:
+                        seen_er_for_total[p_key].add(row_company)
+                        total_units += 1.0
+                else:  # FLAT
                     total_units += 1.0
-            else:  # FLAT
-                total_units += 1.0
-        total_metric_units_by_partner[p_key] = total_units
-        all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
+            total_metric_units_by_partner[p_key] = total_units
+            all_in_tier_by_partner[p_key] = select_tier_for_value(all_in_tiers, total_units)
 
     return {
         "ns_map_by_clean_id": ns_map_by_clean_id,
@@ -1492,7 +1499,16 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
         selected_tier: Optional[Tier] = None
         metric_value_used: float = 0.0
         row["tier_type"] = mode
-        if mode == "SPLIT":
+        if metric == "IU_PER_ER":
+            # Per-row: tier is determined by this ER's individual user count (IUs per ER).
+            # Below 5 IUs → first tier (e.g. $20 flat); 5+ IUs → true ER/IU fee tier.
+            metric_value_used = max(num(row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
+            tier_value = metric_value_used
+            selected_tier = select_tier_for_value(
+                split_tiers_by_partner.get(p_key, tiers),
+                tier_value,
+            )
+        elif mode == "SPLIT":
             if metric == "IU":
                 increment = max(num(row.get("TOTAL_INDIVIDUAL_USERS")), 0.0)
             elif metric == "ER":
