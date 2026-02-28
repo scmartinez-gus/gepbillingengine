@@ -24,7 +24,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -37,8 +37,14 @@ from billing_engine import (
     DEFAULT_USAGE_PREFIX,
     run_billing_engine,
 )
+from accrual_engine import (
+    DEFAULT_ACCRUAL_OUTPUT_DIR,
+    DEFAULT_V3_USAGE_DIR,
+    run_accrual,
+)
 
 DEFAULT_POLL_INTERVAL = 1800  # 30 minutes
+DEFAULT_ACCRUAL_DAY = 25  # day of month to auto-run accrual
 
 WATCHER_STATE_DIR = Path("outputs") / "watcher_state"
 PROCESSED_LEDGER = WATCHER_STATE_DIR / "processed_files.json"
@@ -221,6 +227,92 @@ def _send_slack(webhook_url: str, record: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Scheduled accrual execution
+# ---------------------------------------------------------------------------
+def _should_run_accrual(ledger: Dict[str, Any], accrual_day: int) -> Optional[date]:
+    """Return the accrual month (as first-of-month date) if an accrual should run now, else None.
+
+    Runs when today >= accrual_day and no successful accrual exists for this month yet.
+    """
+    today = datetime.now(timezone.utc).date()
+    if today.day < accrual_day:
+        return None
+    accrual_month = date(today.year, today.month, 1)
+    month_key = f"{accrual_month.year:04d}-{accrual_month.month:02d}"
+    accruals = ledger.get("accruals", {})
+    existing = accruals.get(month_key, {})
+    if existing.get("status") == "completed":
+        return None
+    return accrual_month
+
+
+def _execute_accrual_run(
+    accrual_month: date,
+    inputs_dir: Path,
+    usage_dir: Path,
+    accrual_output_dir: Path,
+    slack_webhook: str,
+    config_filename: str,
+) -> Dict[str, Any]:
+    """Run the accrual engine for the given month. Returns a record for the ledger."""
+    month_key = f"{accrual_month.year:04d}-{accrual_month.month:02d}"
+    started_at = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record: Dict[str, Any] = {
+        "month": month_key,
+        "started_at_utc": started_at,
+        "status": "running",
+        "trigger": "watcher_schedule",
+    }
+
+    logger.info("=" * 60)
+    logger.info("ACCRUAL RUN STARTING  [%s]", month_key)
+    logger.info("Using prior-month usage to estimate %s revenue", month_key)
+    logger.info("=" * 60)
+
+    rules_path = (inputs_dir / config_filename).resolve()
+    try:
+        je_path, totals_path = run_accrual(
+            accrual_month=accrual_month,
+            usage_dir=usage_dir,
+            rules_path=rules_path,
+            output_dir=accrual_output_dir,
+            logger=logger,
+            save_billing_detail=True,
+        )
+        record.update({
+            "status": "completed",
+            "completed_at_utc": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "je_path": str(je_path),
+            "totals_path": str(totals_path),
+        })
+        logger.info("ACCRUAL RUN COMPLETED  [%s]", month_key)
+        logger.info("JE CSV:     %s", je_path)
+        logger.info("Totals CSV: %s", totals_path)
+    except Exception:
+        tb = traceback.format_exc()
+        record.update({
+            "status": "failed",
+            "completed_at_utc": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "error": tb,
+        })
+        logger.error("ACCRUAL RUN FAILED  [%s]\n%s", month_key, tb)
+
+    if slack_webhook:
+        status_emoji = {"completed": "\u2705", "failed": "\U0001f6a8"}.get(record["status"], "\u2753")
+        text = (
+            f"{status_emoji} *GEP Billing Watcher* — accrual `{month_key}`\n"
+            f"*Status:* {record['status'].upper()}\n"
+            f"*Accrual month:* {month_key}\n"
+            f"*JE file:* {record.get('je_path', 'N/A')}"
+        )
+        slack_err = _send_slack(slack_webhook, {"status": record["status"], "run_id": f"accrual-{month_key}", "billing_period": month_key, "usage_file_name": "prior-month", "outputs_dir": str(accrual_output_dir), "audit_rows": []})
+        if slack_err:
+            logger.warning(slack_err)
+
+    return record
+
+
+# ---------------------------------------------------------------------------
 # Billing run execution
 # ---------------------------------------------------------------------------
 def _execute_billing_run(
@@ -324,10 +416,23 @@ def run_watcher(
     poll_interval: int,
     slack_webhook: str,
     dry_run: bool = False,
+    accrual_day: int = DEFAULT_ACCRUAL_DAY,
+    usage_dir: Optional[Path] = None,
+    accrual_output_dir: Optional[Path] = None,
+    disable_accrual: bool = False,
 ) -> None:
-    """Poll inputs_dir for new usage files and run billing when found."""
+    """Poll inputs_dir for new usage files and run billing when found.
+
+    Also auto-runs accruals on the ``accrual_day`` of each month using
+    the prior month's usage file (same basis as a manual CLI accrual).
+    """
     _ensure_state_dir()
     ledger = _load_ledger()
+
+    if usage_dir is None:
+        usage_dir = DEFAULT_V3_USAGE_DIR
+    if accrual_output_dir is None:
+        accrual_output_dir = DEFAULT_ACCRUAL_OUTPUT_DIR
 
     logger.info("=" * 60)
     logger.info("GEP BILLING WATCHER STARTED")
@@ -337,12 +442,15 @@ def run_watcher(
     logger.info("  Poll interval: %d seconds (%d minutes)", poll_interval, poll_interval // 60)
     logger.info("  Slack:         %s", "configured" if slack_webhook else "not configured")
     logger.info("  Dry run:       %s", dry_run)
+    logger.info("  Accrual:       %s (day %d)", "disabled" if disable_accrual else "enabled", accrual_day)
+    logger.info("  Usage dir:     %s", usage_dir)
     logger.info("  Ledger:        %s", PROCESSED_LEDGER)
     logger.info("  Processed so far: %d file(s)", len(ledger["processed"]))
     logger.info("=" * 60)
 
     while not _shutdown_requested:
         try:
+            # --- Usage file processing (existing behavior) ---
             candidates = _find_usage_candidates(inputs_dir, DEFAULT_USAGE_PREFIX)
 
             for usage_file in candidates:
@@ -399,6 +507,25 @@ def run_watcher(
                     "processed_at_utc": record.get("completed_at_utc") or record.get("created_at_utc"),
                 }
                 _save_ledger(ledger)
+
+            # --- Scheduled accrual ---
+            if not disable_accrual and not dry_run:
+                accrual_month = _should_run_accrual(ledger, accrual_day)
+                if accrual_month is not None:
+                    month_key = f"{accrual_month.year:04d}-{accrual_month.month:02d}"
+                    logger.info("Accrual trigger: today >= day %d and no completed accrual for %s", accrual_day, month_key)
+                    acc_record = _execute_accrual_run(
+                        accrual_month=accrual_month,
+                        inputs_dir=inputs_dir,
+                        usage_dir=usage_dir,
+                        accrual_output_dir=accrual_output_dir,
+                        slack_webhook=slack_webhook,
+                        config_filename=config_filename,
+                    )
+                    if "accruals" not in ledger:
+                        ledger["accruals"] = {}
+                    ledger["accruals"][month_key] = acc_record
+                    _save_ledger(ledger)
 
         except Exception:
             logger.exception("Error during poll cycle — will retry next cycle.")
@@ -464,6 +591,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Clear the processed-files ledger and start fresh.",
     )
+    parser.add_argument(
+        "--accrual-day",
+        type=int,
+        default=DEFAULT_ACCRUAL_DAY,
+        help=f"Day of month to auto-run accruals (default: {DEFAULT_ACCRUAL_DAY}).",
+    )
+    parser.add_argument(
+        "--usage-dir",
+        default=str(DEFAULT_V3_USAGE_DIR),
+        help="Directory with prior-month usage CSVs for accrual (default: v3 query exports on Google Drive).",
+    )
+    parser.add_argument(
+        "--accrual-output-dir",
+        default=str(DEFAULT_ACCRUAL_OUTPUT_DIR),
+        help="Output directory for accrual JE and totals CSVs.",
+    )
+    parser.add_argument(
+        "--disable-accrual",
+        action="store_true",
+        help="Disable automatic accrual scheduling.",
+    )
     return parser
 
 
@@ -487,6 +635,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     inputs_dir = Path(args.inputs_dir).resolve()
     outputs_dir = Path(args.outputs_dir).resolve()
+    usage_dir = Path(args.usage_dir).resolve()
+    accrual_output_dir = Path(args.accrual_output_dir).resolve()
 
     if not inputs_dir.exists():
         logger.error("Inputs directory does not exist: %s", inputs_dir)
@@ -500,6 +650,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             poll_interval=args.poll_interval,
             slack_webhook=args.slack_webhook,
             dry_run=args.dry_run,
+            accrual_day=args.accrual_day,
+            usage_dir=usage_dir,
+            accrual_output_dir=accrual_output_dir,
+            disable_accrual=args.disable_accrual,
         )
     except BillingEngineError as exc:
         logger.error("%s", exc)

@@ -125,15 +125,23 @@ def _load_watcher_ledger() -> Dict[str, Any]:
         return {}
 
 
-def _watcher_is_running() -> bool:
+def _launchd_service_is_running(label: str) -> bool:
     try:
         result = subprocess.run(
             ["launchctl", "list"],
             capture_output=True, text=True, timeout=5,
         )
-        return "com.gep.billing-watcher" in result.stdout
+        return label in result.stdout
     except Exception:
         return False
+
+
+def _watcher_is_running() -> bool:
+    return _launchd_service_is_running("com.gep.billing-watcher")
+
+
+def _dashboard_is_running() -> bool:
+    return _launchd_service_is_running("com.gep.billing-dashboard")
 
 
 def _watcher_recent_log(lines: int = 25) -> str:
@@ -371,13 +379,20 @@ def page_run_history() -> None:
 
 
 def page_watcher_status() -> None:
-    running = _watcher_is_running()
-
-    if running:
-        st.success("Watcher is running", icon="\u2705")
-    else:
-        st.error("Watcher is not running", icon="\u274c")
-        st.caption("Start it with: `launchctl load ~/Library/LaunchAgents/com.gep.billing-watcher.plist`")
+    st.markdown("### Services")
+    svc_col1, svc_col2 = st.columns(2)
+    with svc_col1:
+        if _watcher_is_running():
+            st.success("Billing Watcher — running", icon="\u2705")
+        else:
+            st.error("Billing Watcher — stopped", icon="\u274c")
+            st.caption("Start: `launchctl load ~/Library/LaunchAgents/com.gep.billing-watcher.plist`")
+    with svc_col2:
+        if _dashboard_is_running():
+            st.success("Dashboard Service — running", icon="\u2705")
+        else:
+            st.warning("Dashboard Service — not installed as service", icon="\u2139\ufe0f")
+            st.caption("Install: `cp com.gep.billing-dashboard.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.gep.billing-dashboard.plist`")
 
     st.markdown("---")
     st.markdown("### Processed Files")
@@ -398,6 +413,20 @@ def page_watcher_status() -> None:
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+    accruals = ledger.get("accruals", {})
+    if accruals:
+        st.markdown("---")
+        st.markdown("### Automated Accruals")
+        acc_rows = []
+        for month_key, info in sorted(accruals.items(), reverse=True):
+            acc_rows.append({
+                "Accrual Month": month_key,
+                "Status": info.get("status", ""),
+                "Run At (UTC)": info.get("completed_at_utc", info.get("started_at_utc", "")),
+                "JE File": Path(info.get("je_path", "")).name if info.get("je_path") else "",
+            })
+        st.dataframe(pd.DataFrame(acc_rows), use_container_width=True, hide_index=True)
+
     st.markdown("---")
     st.markdown("### Recent Watcher Log")
     log_text = _watcher_recent_log(30)
@@ -408,6 +437,7 @@ def page_watcher_status() -> None:
     st.markdown(f"- **Watching:** `{DEFAULT_INPUTS_DIR}`")
     st.markdown(f"- **Outputs:** `{DEFAULT_OUTPUTS_DIR}`")
     st.markdown("- **Poll interval:** 30 minutes")
+    st.markdown("- **Accrual schedule:** auto-run on the 25th of each month")
     st.markdown(f"- **Ledger:** `{WATCHER_LEDGER}`")
 
 
