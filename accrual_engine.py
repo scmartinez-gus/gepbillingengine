@@ -22,12 +22,15 @@ import pandas as pd
 from billing_engine import (
     BillingEngineError,
     DEFAULT_CONFIG_FILE,
+    DEFAULT_OUTPUTS_DIR,
     month_end,
     normalize_dataframe_columns,
     parse_date,
     round2,
     run_billing_engine,
 )
+
+DEFAULT_ACCRUAL_OUTPUT_DIR = DEFAULT_OUTPUTS_DIR / "gep_accrual"
 
 
 # -----------------------------------------------------------------------------
@@ -450,8 +453,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     acc.add_argument(
         "--output-dir",
-        default="outputs/accrual",
-        help="Output directory for JE CSV and accrual totals CSV.",
+        default=str(DEFAULT_ACCRUAL_OUTPUT_DIR),
+        help="Output directory for JE CSV and accrual totals CSV (default: Google Drive outputs/gep_accrual).",
     )
     acc.add_argument(
         "--log-level",

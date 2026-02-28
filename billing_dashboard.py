@@ -28,7 +28,7 @@ BILLING_LOG_DIR = OUTPUTS_DIR / "gep_billing_log"
 PARTNER_DETAILS_DIR = OUTPUTS_DIR / "gep_partner_details"
 NETSUITE_CSV_PATH = OUTPUTS_DIR / "gep_netsuite_invoice_import.csv"
 
-ACCRUAL_OUTPUT_DIR = Path("outputs") / "accrual"
+ACCRUAL_OUTPUT_DIR = OUTPUTS_DIR / "gep_accrual"
 
 WATCHER_STATE_DIR = Path("outputs") / "watcher_state"
 WATCHER_LEDGER = WATCHER_STATE_DIR / "processed_files.json"
@@ -417,8 +417,7 @@ def page_accruals() -> None:
         st.code(
             'python3 accrual_engine.py accrual \\\n'
             '  --accrual-month 2026-02 \\\n'
-            '  --rules-path "/path/to/gep_billing_rules.xlsx" \\\n'
-            '  --output-dir ./outputs/accrual',
+            '  --rules-path "/path/to/gep_billing_rules.xlsx"',
             language="bash",
         )
         return

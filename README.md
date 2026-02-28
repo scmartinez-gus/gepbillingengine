@@ -86,9 +86,10 @@ Uses the latest usage CSV in the v3 folder whose date prefix is before the accru
 ```bash
 python3 accrual_engine.py accrual \
   --accrual-month 2026-02 \
-  --rules-path "/path/to/gep_billing_rules.xlsx" \
-  --output-dir ./outputs/accrual
+  --rules-path "/path/to/gep_billing_rules.xlsx"
 ```
+
+Outputs default to the Google Drive `billing_engine_test/outputs/gep_accrual/` folder (same root as billing outputs). Override with `--output-dir` if needed.
 
 Optional: `--usage-dir` (default: v3 invoice queries folder), `--log-level`.
 
