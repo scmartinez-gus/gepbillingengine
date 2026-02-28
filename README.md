@@ -58,31 +58,19 @@ python3 billing_watcher.py \
 
 Press `Ctrl+C` — it will finish the current cycle and exit cleanly.
 
-## Billing Import Portal (MVP)
+## Billing Dashboard (monitoring)
 
-This project includes a Streamlit-based import portal:
-
-- Upload usage CSV
-- Validate input before run
-- Execute billing run
-- View audit controls and run status
-- Download outputs (master report, NetSuite CSV, partner ZIP, run manifest)
-- Optional Slack notifications via webhook
-
-Run locally:
+Read-only dashboard for reviewing billing results. No uploads, no manual triggers — it reads directly from the outputs the watcher produces.
 
 ```bash
-streamlit run billing_portal.py
+python3 -m streamlit run billing_dashboard.py
 ```
 
-### Portal configuration
+Three tabs:
 
-- **Rules workbook path** is set in the sidebar.
-- Optional Slack webhook can be entered in the sidebar or environment:
-
-```bash
-export BILLING_SLACK_WEBHOOK="https://hooks.slack.com/services/..."
-```
+- **Latest Run** — status banner (pass/fail), key metrics (total billed, partners, end users, revenue breakdown), Audit & Controls table, Executive Summary by partner, and download buttons.
+- **Run History** — table of all past runs with details. Select any run to view its audit and summary.
+- **Watcher Status** — is the watcher running, which files have been processed, and recent log output.
 
 ## Accrual Engine (CLI)
 
