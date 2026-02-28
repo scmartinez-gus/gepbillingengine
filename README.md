@@ -16,6 +16,48 @@ python3 billing_engine.py \
   --outputs-dir "/path/to/outputs"
 ```
 
+## Billing Watcher (automated runs)
+
+A background service that monitors the inputs folder for new usage files. When a `gepusage*.csv` appears, the watcher confirms the file is fully synced (stable file size across two consecutive polls), then runs the billing engine automatically.
+
+### Start the watcher
+
+```bash
+python3 billing_watcher.py
+```
+
+This checks the default Google Drive inputs folder every 30 minutes. Outputs go to the default outputs folder. To customize:
+
+```bash
+python3 billing_watcher.py \
+  --inputs-dir "/path/to/inputs" \
+  --outputs-dir "/path/to/outputs" \
+  --poll-interval 900 \
+  --slack-webhook "https://hooks.slack.com/services/..."
+```
+
+### How it works
+
+1. Every N seconds (default 1800 = 30 min), the watcher lists the inputs folder for `gepusage*.csv` files.
+2. New files are held for one cycle to confirm the file size is stable (Google Drive sync is finished).
+3. Once stable, the billing engine runs and outputs are written (Master Report, NetSuite CSV, partner details).
+4. The file is recorded in a local ledger (`outputs/watcher_state/processed_files.json`) so it won't be processed again.
+5. If a Slack webhook is configured, a notification is sent with run status and audit outcome.
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--poll-interval` | 1800 (30 min) | Seconds between folder checks |
+| `--slack-webhook` | `$BILLING_SLACK_WEBHOOK` | Slack webhook URL for notifications |
+| `--dry-run` | off | Detect files but don't run billing |
+| `--reset-ledger` | off | Clear the processed-files ledger and start fresh |
+| `--log-level` | INFO | DEBUG, INFO, WARNING, or ERROR |
+
+### Stop the watcher
+
+Press `Ctrl+C` — it will finish the current cycle and exit cleanly.
+
 ## Billing Import Portal (MVP)
 
 This project includes a Streamlit-based import portal:
