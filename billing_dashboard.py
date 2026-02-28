@@ -9,11 +9,11 @@ No uploads, no manual triggers. Just open it and see what happened.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import subprocess
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -149,7 +149,6 @@ def _watcher_recent_log(lines: int = 25) -> str:
 def _zip_partner_details() -> Optional[bytes]:
     if not PARTNER_DETAILS_DIR.exists():
         return None
-    import io
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for file_path in PARTNER_DETAILS_DIR.rglob("*"):
@@ -202,15 +201,16 @@ def _render_summary_metrics(summary_df: Optional[pd.DataFrame]) -> None:
         elif "billable" in col_lower and "user" in col_lower:
             total_billable_users = int(series.sum())
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Billed", f"${total_billed:,.2f}")
     col2.metric("Partners", f"{partner_count}")
     col3.metric("Active End Users", f"{total_end_users:,}")
+    col4.metric("Billable Users", f"{total_billable_users:,}")
 
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Usage Revenue", f"${total_usage:,.2f}")
-    col5.metric("Next-Day Fee Revenue", f"${total_next_day:,.2f}")
-    col6.metric("Minimum Revenue", f"${total_minimum:,.2f}")
+    col5, col6, col7 = st.columns(3)
+    col5.metric("Usage Revenue", f"${total_usage:,.2f}")
+    col6.metric("Next-Day Fee Revenue", f"${total_next_day:,.2f}")
+    col7.metric("Minimum Revenue", f"${total_minimum:,.2f}")
 
 
 def _render_downloads(report_path: Optional[Path], key_prefix: str) -> None:
@@ -407,7 +407,7 @@ def page_watcher_status() -> None:
     st.markdown("### Watcher Configuration")
     st.markdown(f"- **Watching:** `{DEFAULT_INPUTS_DIR}`")
     st.markdown(f"- **Outputs:** `{DEFAULT_OUTPUTS_DIR}`")
-    st.markdown(f"- **Poll interval:** 30 minutes")
+    st.markdown("- **Poll interval:** 30 minutes")
     st.markdown(f"- **Ledger:** `{WATCHER_LEDGER}`")
 
 

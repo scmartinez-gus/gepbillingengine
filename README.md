@@ -66,9 +66,10 @@ Read-only dashboard for reviewing billing results. No uploads, no manual trigger
 python3 -m streamlit run billing_dashboard.py
 ```
 
-Three tabs:
+Four tabs:
 
 - **Latest Run** — status banner (pass/fail), key metrics (total billed, partners, end users, revenue breakdown), Audit & Controls table, Executive Summary by partner, and download buttons.
+- **Accruals** — accrual totals, journal entry preview, variance report (accrual vs actual), and downloads.
 - **Run History** — table of all past runs with details. Select any run to view its audit and summary.
 - **Watcher Status** — is the watcher running, which files have been processed, and recent log output.
 
@@ -99,9 +100,9 @@ Compare accrual estimate to actual billing output. Run after the real billing ru
 
 ```bash
 python3 accrual_engine.py variance \
-  --accrual-totals ./outputs/accrual/gep_accrual_totals_202601.csv \
-  --actual-master-report "/path/to/2026.01_Master_Billing_Report.xlsx" \
-  --output ./outputs/accrual/variance_202601.csv
+  --accrual-totals "/path/to/outputs/gep_accrual/gep_accrual_totals_202601.csv" \
+  --actual-master-report "/path/to/outputs/gep_billing_log/2026.01_Master_Billing_Report.xlsx" \
+  --output "/path/to/outputs/gep_accrual/variance_202601.csv"
 ```
 
 Optional: `--materiality-pct` (default 5).
