@@ -58,31 +58,20 @@ python3 billing_watcher.py \
 
 Press `Ctrl+C` — it will finish the current cycle and exit cleanly.
 
-## Billing Import Portal (MVP)
+## Billing Dashboard (monitoring)
 
-This project includes a Streamlit-based import portal:
-
-- Upload usage CSV
-- Validate input before run
-- Execute billing run
-- View audit controls and run status
-- Download outputs (master report, NetSuite CSV, partner ZIP, run manifest)
-- Optional Slack notifications via webhook
-
-Run locally:
+Read-only dashboard for reviewing billing results. No uploads, no manual triggers — it reads directly from the outputs the watcher produces.
 
 ```bash
-streamlit run billing_portal.py
+python3 -m streamlit run billing_dashboard.py
 ```
 
-### Portal configuration
+Four tabs:
 
-- **Rules workbook path** is set in the sidebar.
-- Optional Slack webhook can be entered in the sidebar or environment:
-
-```bash
-export BILLING_SLACK_WEBHOOK="https://hooks.slack.com/services/..."
-```
+- **Latest Run** — status banner (pass/fail), key metrics (total billed, partners, end users, revenue breakdown), Audit & Controls table, Executive Summary by partner, and download buttons.
+- **Accruals** — accrual totals, journal entry preview, variance report (accrual vs actual), and downloads.
+- **Run History** — table of all past runs with details. Select any run to view its audit and summary.
+- **Watcher Status** — is the watcher running, which files have been processed, and recent log output.
 
 ## Accrual Engine (CLI)
 
@@ -98,9 +87,10 @@ Uses the latest usage CSV in the v3 folder whose date prefix is before the accru
 ```bash
 python3 accrual_engine.py accrual \
   --accrual-month 2026-02 \
-  --rules-path "/path/to/gep_billing_rules.xlsx" \
-  --output-dir ./outputs/accrual
+  --rules-path "/path/to/gep_billing_rules.xlsx"
 ```
+
+Outputs default to the Google Drive `billing_engine_test/outputs/gep_accrual/` folder (same root as billing outputs). Override with `--output-dir` if needed.
 
 Optional: `--usage-dir` (default: v3 invoice queries folder), `--log-level`.
 
@@ -110,9 +100,9 @@ Compare accrual estimate to actual billing output. Run after the real billing ru
 
 ```bash
 python3 accrual_engine.py variance \
-  --accrual-totals ./outputs/accrual/gep_accrual_totals_202601.csv \
-  --actual-master-report "/path/to/2026.01_Master_Billing_Report.xlsx" \
-  --output ./outputs/accrual/variance_202601.csv
+  --accrual-totals "/path/to/outputs/gep_accrual/gep_accrual_totals_202601.csv" \
+  --actual-master-report "/path/to/outputs/gep_billing_log/2026.01_Master_Billing_Report.xlsx" \
+  --output "/path/to/outputs/gep_accrual/variance_202601.csv"
 ```
 
 Optional: `--materiality-pct` (default 5).
