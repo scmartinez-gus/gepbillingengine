@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>com.gep.billing-dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>-m</string>
+        <string>streamlit</string>
+        <string>run</string>
+        <string>/Users/sam.martinez/Documents/GitHub/gepbillingengine/billing_dashboard.py</string>
+        <string>--server.port</string>
+        <string>8502</string>
+        <string>--server.headless</string>
+        <string>true</string>
+        <string>--server.fileWatcherType</string>
+        <string>none</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/sam.martinez/Documents/GitHub/gepbillingengine</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sam.martinez/Documents/GitHub/gepbillingengine/logs/dashboard_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/sam.martinez/Documents/GitHub/gepbillingengine/logs/dashboard_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+</dict>
+</plist>

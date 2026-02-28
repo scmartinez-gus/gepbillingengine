@@ -44,6 +44,12 @@ python3 billing_watcher.py \
 4. The file is recorded in a local ledger (`outputs/watcher_state/processed_files.json`) so it won't be processed again.
 5. If a Slack webhook is configured, a notification is sent with run status and audit outcome.
 
+### Automated accruals
+
+The watcher automatically runs the accrual engine on the 25th of each month (configurable with `--accrual-day`). It uses the prior month's usage file — the same one that was used for the previous month's actual bill — re-priced for the current month. The accrual only runs once per month; the result is tracked in the ledger.
+
+To disable: `--disable-accrual`. To change the trigger day: `--accrual-day 27`.
+
 ### Options
 
 | Flag | Default | Description |
@@ -52,6 +58,10 @@ python3 billing_watcher.py \
 | `--slack-webhook` | `$BILLING_SLACK_WEBHOOK` | Slack webhook URL for notifications |
 | `--dry-run` | off | Detect files but don't run billing |
 | `--reset-ledger` | off | Clear the processed-files ledger and start fresh |
+| `--accrual-day` | 25 | Day of month to auto-run accruals |
+| `--usage-dir` | v3 query exports | Directory with prior-month usage CSVs for accrual |
+| `--accrual-output-dir` | `outputs/gep_accrual` | Output directory for accrual JE and totals |
+| `--disable-accrual` | off | Disable automatic accrual scheduling |
 | `--log-level` | INFO | DEBUG, INFO, WARNING, or ERROR |
 
 ### Stop the watcher
@@ -62,16 +72,29 @@ Press `Ctrl+C` — it will finish the current cycle and exit cleanly.
 
 Read-only dashboard for reviewing billing results. No uploads, no manual triggers — it reads directly from the outputs the watcher produces.
 
+### Auto-start (launchd service)
+
+The dashboard can run as a persistent macOS service at `http://localhost:8502`:
+
+```bash
+cp com.gep.billing-dashboard.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.gep.billing-dashboard.plist
+```
+
+To stop: `launchctl unload ~/Library/LaunchAgents/com.gep.billing-dashboard.plist`
+
+### Manual start
+
 ```bash
 python3 -m streamlit run billing_dashboard.py
 ```
 
-Four tabs:
+### Tabs
 
 - **Latest Run** — status banner (pass/fail), key metrics (total billed, partners, end users, revenue breakdown), Audit & Controls table, Executive Summary by partner, and download buttons.
 - **Accruals** — accrual totals, journal entry preview, variance report (accrual vs actual), and downloads.
 - **Run History** — table of all past runs with details. Select any run to view its audit and summary.
-- **Watcher Status** — is the watcher running, which files have been processed, and recent log output.
+- **Watcher Status** — service health for both watcher and dashboard, processed files, automated accrual history, and recent log output.
 
 ## Accrual Engine (CLI)
 
