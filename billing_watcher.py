@@ -271,7 +271,7 @@ def _execute_accrual_run(
 
     rules_path = (inputs_dir / config_filename).resolve()
     try:
-        je_path, totals_path = run_accrual(
+        je_path, totals_path, support_path = run_accrual(
             accrual_month=accrual_month,
             usage_dir=usage_dir,
             rules_path=rules_path,
@@ -284,6 +284,7 @@ def _execute_accrual_run(
             "completed_at_utc": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "je_path": str(je_path),
             "totals_path": str(totals_path),
+            "support_workbook_path": str(support_path),
         })
         logger.info("ACCRUAL RUN COMPLETED  [%s]", month_key)
         logger.info("JE CSV:     %s", je_path)
