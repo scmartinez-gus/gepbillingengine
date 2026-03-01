@@ -434,10 +434,10 @@ def page_watcher_status() -> None:
 
     st.markdown("---")
     st.markdown("### Watcher Configuration")
-    st.markdown(f"- **Watching:** `{DEFAULT_INPUTS_DIR}`")
+    st.markdown("- **Usage source:** v3 query exports (watches for `YYYY.MM_*.csv`)")
     st.markdown(f"- **Outputs:** `{DEFAULT_OUTPUTS_DIR}`")
     st.markdown("- **Poll interval:** 30 minutes")
-    st.markdown("- **Accrual schedule:** auto-run on the 25th of each month")
+    st.markdown("- **Accrual schedule:** auto-run on the 25th of each month (uses prior month's file from same folder)")
     st.markdown(f"- **Ledger:** `{WATCHER_LEDGER}`")
 
 
