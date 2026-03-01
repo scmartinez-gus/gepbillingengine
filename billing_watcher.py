@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Polling file watcher for automated GEP billing runs.
 
-Monitors the inputs directory for new gepusage*.csv files. When a new file
-appears and is confirmed stable (Google Drive sync finished), the billing
+Monitors the v3 usage queries folder for new YYYY.MM_*.csv files. When a new
+file appears and is confirmed stable (Google Drive sync finished), the billing
 engine runs automatically. Results are logged and optionally sent to Slack.
 
 Usage:
@@ -18,8 +18,11 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -104,16 +107,19 @@ def _file_sha256(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
-def _find_usage_candidates(inputs_dir: Path, prefix: str) -> List[Path]:
-    """Return gepusage*.csv files sorted newest-first by modification time."""
-    if not inputs_dir.exists():
+_USAGE_DATE_PREFIX = re.compile(r"^(\d{4})\.(\d{1,2})_")
+
+
+def _find_usage_candidates(watch_dir: Path) -> List[Path]:
+    """Return YYYY.MM_*.csv files sorted newest-first by modification time."""
+    if not watch_dir.exists():
         return []
     candidates = [
         p
-        for p in inputs_dir.iterdir()
+        for p in watch_dir.iterdir()
         if p.is_file()
         and p.suffix.lower() == ".csv"
-        and p.name.lower().startswith(prefix.lower())
+        and _USAGE_DATE_PREFIX.match(p.name)
     ]
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates
@@ -271,7 +277,7 @@ def _execute_accrual_run(
 
     rules_path = (inputs_dir / config_filename).resolve()
     try:
-        je_path, totals_path = run_accrual(
+        je_path, totals_path, support_path = run_accrual(
             accrual_month=accrual_month,
             usage_dir=usage_dir,
             rules_path=rules_path,
@@ -284,6 +290,7 @@ def _execute_accrual_run(
             "completed_at_utc": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "je_path": str(je_path),
             "totals_path": str(totals_path),
+            "support_workbook_path": str(support_path),
         })
         logger.info("ACCRUAL RUN COMPLETED  [%s]", month_key)
         logger.info("JE CSV:     %s", je_path)
@@ -317,12 +324,16 @@ def _execute_accrual_run(
 # ---------------------------------------------------------------------------
 def _execute_billing_run(
     usage_file: Path,
-    inputs_dir: Path,
+    rules_dir: Path,
     outputs_dir: Path,
     config_filename: str,
     slack_webhook: str,
 ) -> Dict[str, Any]:
-    """Run the billing engine for a detected usage file and return a result record."""
+    """Run the billing engine for a detected usage file and return a result record.
+
+    Copies the usage file and rules workbook into a temp directory so the
+    billing engine can discover them with its standard prefix-based lookup.
+    """
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
     created_at = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     file_hash = _file_sha256(usage_file)
@@ -344,13 +355,21 @@ def _execute_billing_run(
     logger.info("=" * 60)
 
     try:
-        run_billing_engine(
-            inputs_dir=inputs_dir,
-            outputs_dir=outputs_dir,
-            usage_prefix=DEFAULT_USAGE_PREFIX,
-            config_filename=config_filename,
-            logger=logger,
-        )
+        with tempfile.TemporaryDirectory(prefix="gep_billing_") as tmp:
+            tmp_inputs = Path(tmp) / "inputs"
+            tmp_inputs.mkdir()
+            shutil.copy2(usage_file, tmp_inputs / f"{DEFAULT_USAGE_PREFIX}.csv")
+            rules_src = rules_dir / config_filename
+            if rules_src.exists():
+                shutil.copy2(rules_src, tmp_inputs / config_filename)
+
+            run_billing_engine(
+                inputs_dir=tmp_inputs,
+                outputs_dir=outputs_dir,
+                usage_prefix=DEFAULT_USAGE_PREFIX,
+                config_filename=config_filename,
+                logger=logger,
+            )
 
         history_dir = outputs_dir / "gep_billing_log"
         report_candidates = sorted(history_dir.glob("*_Master_Billing_Report.xlsx"))
@@ -410,48 +429,47 @@ def _execute_billing_run(
 # Core polling loop
 # ---------------------------------------------------------------------------
 def run_watcher(
-    inputs_dir: Path,
+    rules_dir: Path,
     outputs_dir: Path,
+    usage_dir: Path,
     config_filename: str,
     poll_interval: int,
     slack_webhook: str,
     dry_run: bool = False,
     accrual_day: int = DEFAULT_ACCRUAL_DAY,
-    usage_dir: Optional[Path] = None,
     accrual_output_dir: Optional[Path] = None,
     disable_accrual: bool = False,
 ) -> None:
-    """Poll inputs_dir for new usage files and run billing when found.
+    """Poll usage_dir for new YYYY.MM_*.csv files and run billing when found.
 
-    Also auto-runs accruals on the ``accrual_day`` of each month using
-    the prior month's usage file (same basis as a manual CLI accrual).
+    Both billing and accrual use the same usage_dir as the single source of
+    truth. The rules workbook is read from rules_dir. Accruals auto-run on
+    the ``accrual_day`` of each month using the prior month's file.
     """
     _ensure_state_dir()
     ledger = _load_ledger()
 
-    if usage_dir is None:
-        usage_dir = DEFAULT_V3_USAGE_DIR
     if accrual_output_dir is None:
         accrual_output_dir = DEFAULT_ACCRUAL_OUTPUT_DIR
 
     logger.info("=" * 60)
     logger.info("GEP BILLING WATCHER STARTED")
-    logger.info("  Inputs:        %s", inputs_dir)
+    logger.info("  Usage dir:     %s", usage_dir)
+    logger.info("  Rules dir:     %s", rules_dir)
     logger.info("  Outputs:       %s", outputs_dir)
     logger.info("  Rules file:    %s", config_filename)
     logger.info("  Poll interval: %d seconds (%d minutes)", poll_interval, poll_interval // 60)
     logger.info("  Slack:         %s", "configured" if slack_webhook else "not configured")
     logger.info("  Dry run:       %s", dry_run)
     logger.info("  Accrual:       %s (day %d)", "disabled" if disable_accrual else "enabled", accrual_day)
-    logger.info("  Usage dir:     %s", usage_dir)
     logger.info("  Ledger:        %s", PROCESSED_LEDGER)
     logger.info("  Processed so far: %d file(s)", len(ledger["processed"]))
     logger.info("=" * 60)
 
     while not _shutdown_requested:
         try:
-            # --- Usage file processing (existing behavior) ---
-            candidates = _find_usage_candidates(inputs_dir, DEFAULT_USAGE_PREFIX)
+            # --- Usage file processing ---
+            candidates = _find_usage_candidates(usage_dir)
 
             for usage_file in candidates:
                 file_key = usage_file.name
@@ -493,7 +511,7 @@ def run_watcher(
 
                 record = _execute_billing_run(
                     usage_file=usage_file,
-                    inputs_dir=inputs_dir,
+                    rules_dir=rules_dir,
                     outputs_dir=outputs_dir,
                     config_filename=config_filename,
                     slack_webhook=slack_webhook,
@@ -516,7 +534,7 @@ def run_watcher(
                     logger.info("Accrual trigger: today >= day %d and no completed accrual for %s", accrual_day, month_key)
                     acc_record = _execute_accrual_run(
                         accrual_month=accrual_month,
-                        inputs_dir=inputs_dir,
+                        inputs_dir=rules_dir,
                         usage_dir=usage_dir,
                         accrual_output_dir=accrual_output_dir,
                         slack_webhook=slack_webhook,
@@ -548,12 +566,17 @@ def run_watcher(
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poll for new GEP usage files and run billing automatically."
+        description="Poll for new GEP usage files (YYYY.MM_*.csv) and run billing automatically."
     )
     parser.add_argument(
-        "--inputs-dir",
+        "--usage-dir",
+        default=str(DEFAULT_V3_USAGE_DIR),
+        help="Directory to watch for YYYY.MM_*.csv usage files (default: v3 query exports on Google Drive).",
+    )
+    parser.add_argument(
+        "--rules-dir",
         default=str(DEFAULT_INPUTS_DIR),
-        help="Directory to watch for gepusage*.csv files (default: Google Drive inputs).",
+        help="Directory containing the billing rules workbook (default: Google Drive inputs).",
     )
     parser.add_argument(
         "--outputs-dir",
@@ -563,7 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config-file",
         default=DEFAULT_CONFIG_FILE,
-        help="Rules workbook filename inside inputs directory.",
+        help="Rules workbook filename inside rules directory.",
     )
     parser.add_argument(
         "--poll-interval",
@@ -598,11 +621,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Day of month to auto-run accruals (default: {DEFAULT_ACCRUAL_DAY}).",
     )
     parser.add_argument(
-        "--usage-dir",
-        default=str(DEFAULT_V3_USAGE_DIR),
-        help="Directory with prior-month usage CSVs for accrual (default: v3 query exports on Google Drive).",
-    )
-    parser.add_argument(
         "--accrual-output-dir",
         default=str(DEFAULT_ACCRUAL_OUTPUT_DIR),
         help="Output directory for accrual JE and totals CSVs.",
@@ -633,25 +651,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             PROCESSED_LEDGER.unlink()
             logger.info("Ledger cleared.")
 
-    inputs_dir = Path(args.inputs_dir).resolve()
-    outputs_dir = Path(args.outputs_dir).resolve()
     usage_dir = Path(args.usage_dir).resolve()
+    rules_dir = Path(args.rules_dir).resolve()
+    outputs_dir = Path(args.outputs_dir).resolve()
     accrual_output_dir = Path(args.accrual_output_dir).resolve()
 
-    if not inputs_dir.exists():
-        logger.error("Inputs directory does not exist: %s", inputs_dir)
+    if not usage_dir.exists():
+        logger.error("Usage directory does not exist: %s", usage_dir)
         return 2
 
     try:
         run_watcher(
-            inputs_dir=inputs_dir,
+            rules_dir=rules_dir,
             outputs_dir=outputs_dir,
+            usage_dir=usage_dir,
             config_filename=args.config_file,
             poll_interval=args.poll_interval,
             slack_webhook=args.slack_webhook,
             dry_run=args.dry_run,
             accrual_day=args.accrual_day,
-            usage_dir=usage_dir,
             accrual_output_dir=accrual_output_dir,
             disable_accrual=args.disable_accrual,
         )

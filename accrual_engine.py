@@ -261,6 +261,238 @@ def generate_journal_entry_csv(
     logger.info("Wrote journal entry CSV: %s (%d lines)", output_path, len(rows))
 
 
+def _find_prior_variance(output_dir: Path, accrual_month: date) -> Optional[pd.DataFrame]:
+    """Look for a variance report from a prior period to include as historical accuracy evidence."""
+    variance_files = sorted(output_dir.glob("variance_*.csv"), reverse=True)
+    for vf in variance_files:
+        try:
+            df = pd.read_csv(vf)
+            if "Customer" in df.columns and "Variance_Pct" in df.columns:
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def generate_je_support_workbook(
+    aggregated: Dict[str, Dict[str, float]],
+    accrual_month: date,
+    prior_usage_filename: str,
+    master_report_path: Path,
+    output_path: Path,
+    logger: logging.Logger,
+    prior_variance_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Generate a consolidated JE support workbook for controller review.
+
+    Tabs:
+      1. Summary       — methodology, period, totals by customer
+      2. Journal Entry  — debit/credit lines matching the NetSuite import
+      3. Detail         — fee-level billing detail (Source Data from engine)
+      4. Variance       — prior-period accrual vs actual (if available)
+    """
+    import xlsxwriter
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = xlsxwriter.Workbook(str(output_path), {"nan_inf_to_errors": True})
+
+    # --- Shared formats ---
+    fmt_title = wb.add_format({"bold": True, "font_size": 14})
+    fmt_header = wb.add_format({
+        "bold": True, "bg_color": "#2F5496", "font_color": "#FFFFFF",
+        "border": 1, "text_wrap": True,
+    })
+    fmt_money = wb.add_format({"num_format": "$#,##0.00", "border": 1})
+    fmt_money_bold = wb.add_format({"num_format": "$#,##0.00", "border": 1, "bold": True})
+    fmt_pct = wb.add_format({"num_format": "0.0%", "border": 1})
+    fmt_text = wb.add_format({"border": 1})
+    fmt_text_bold = wb.add_format({"border": 1, "bold": True})
+    fmt_label = wb.add_format({"bold": True, "font_size": 11})
+    fmt_meta_val = wb.add_format({"font_size": 11})
+    fmt_pass = wb.add_format({"bg_color": "#D4EDDA", "font_color": "#155724", "border": 1})
+    fmt_warn = wb.add_format({"bg_color": "#FFF3CD", "font_color": "#856404", "border": 1})
+
+    period_label = accrual_month.strftime("%B %Y")
+    memo_base = _memo_base(accrual_month)
+    transaction_date = month_end(accrual_month).strftime("%m/%d/%Y")
+    prepared_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    grand_total = round2(sum(a["total"] for a in aggregated.values()))
+    grand_usage = round2(sum(a["usage"] for a in aggregated.values()))
+    grand_next_day = round2(sum(a["next_day"] for a in aggregated.values()))
+    grand_minimums = round2(sum(a["minimums"] for a in aggregated.values()))
+
+    # =====================================================================
+    # Tab 1: Summary
+    # =====================================================================
+    ws = wb.add_worksheet("Summary")
+    ws.set_column("A:A", 30)
+    ws.set_column("B:B", 50)
+    ws.set_column("C:F", 18)
+    ws.hide_gridlines(2)
+
+    row = 0
+    ws.write(row, 0, "GEP Embedded Payroll — Accrual JE Support", fmt_title)
+    row += 2
+
+    meta = [
+        ("Accrual Period", period_label),
+        ("Transaction Date", transaction_date),
+        ("Methodology", "Prior-month actual usage re-priced at current contract rates"),
+        ("Source Usage File", prior_usage_filename),
+        ("GL Accounts", f"AR {ACCRUAL_GL_AR} / Revenue {ACCRUAL_GL_REVENUE}"),
+        ("Prepared", prepared_at),
+    ]
+    for label, value in meta:
+        ws.write(row, 0, label, fmt_label)
+        ws.write(row, 1, value, fmt_meta_val)
+        row += 1
+
+    row += 1
+    ws.write(row, 0, "Total Accrual", fmt_label)
+    ws.write(row, 1, grand_total, fmt_money_bold)
+    row += 2
+
+    headers = ["Customer", "Usage Revenue", "Next-Day Revenue", "Minimum Revenue", "Total"]
+    for c, h in enumerate(headers):
+        ws.write(row, c, h, fmt_header)
+    row += 1
+
+    for customer, amounts in sorted(aggregated.items()):
+        ws.write(row, 0, customer, fmt_text)
+        ws.write(row, 1, amounts["usage"], fmt_money)
+        ws.write(row, 2, amounts["next_day"], fmt_money)
+        ws.write(row, 3, amounts["minimums"], fmt_money)
+        ws.write(row, 4, amounts["total"], fmt_money)
+        row += 1
+
+    ws.write(row, 0, "TOTAL", fmt_text_bold)
+    ws.write(row, 1, grand_usage, fmt_money_bold)
+    ws.write(row, 2, grand_next_day, fmt_money_bold)
+    ws.write(row, 3, grand_minimums, fmt_money_bold)
+    ws.write(row, 4, grand_total, fmt_money_bold)
+
+    # =====================================================================
+    # Tab 2: Journal Entry
+    # =====================================================================
+    ws_je = wb.add_worksheet("Journal Entry")
+    ws_je.set_column("A:A", 30)
+    ws_je.set_column("B:B", 30)
+    ws_je.set_column("C:C", 16)
+    ws_je.set_column("D:D", 10)
+    ws_je.set_column("E:F", 16)
+    ws_je.set_column("G:H", 40)
+
+    for c, h in enumerate(JE_COLUMNS):
+        ws_je.write(0, c, h, fmt_header)
+
+    je_row = 1
+    for customer, amounts in sorted(aggregated.items()):
+        total = amounts["total"]
+        usage = amounts["usage"]
+        next_day = amounts["next_day"]
+        minimums = amounts["minimums"]
+
+        ws_je.write(je_row, 0, customer, fmt_text)
+        ws_je.write(je_row, 1, "", fmt_text)
+        ws_je.write(je_row, 2, transaction_date, fmt_text)
+        ws_je.write(je_row, 3, ACCRUAL_GL_AR, fmt_text)
+        ws_je.write(je_row, 4, round2(total), fmt_money)
+        ws_je.write(je_row, 5, 0, fmt_money)
+        ws_je.write(je_row, 6, memo_base, fmt_text)
+        ws_je.write(je_row, 7, memo_base, fmt_text)
+        je_row += 1
+
+        for product, amount in [("GEP Usage", usage), ("GEP Next-Day Direct Deposit", next_day), ("GEP Minimums", minimums)]:
+            if amount > 0:
+                ws_je.write(je_row, 0, customer, fmt_text)
+                ws_je.write(je_row, 1, product, fmt_text)
+                ws_je.write(je_row, 2, transaction_date, fmt_text)
+                ws_je.write(je_row, 3, ACCRUAL_GL_REVENUE, fmt_text)
+                ws_je.write(je_row, 4, 0, fmt_money)
+                ws_je.write(je_row, 5, round2(amount), fmt_money)
+                ws_je.write(je_row, 6, f"{memo_base} - {product}", fmt_text)
+                ws_je.write(je_row, 7, memo_base, fmt_text)
+                je_row += 1
+
+    # Totals row
+    ws_je.write(je_row, 0, "", fmt_text_bold)
+    ws_je.write(je_row, 1, "", fmt_text_bold)
+    ws_je.write(je_row, 2, "", fmt_text_bold)
+    ws_je.write(je_row, 3, "TOTAL", fmt_text_bold)
+    ws_je.write(je_row, 4, grand_total, fmt_money_bold)
+    ws_je.write(je_row, 5, grand_total, fmt_money_bold)
+    ws_je.write(je_row, 6, "Debits = Credits", fmt_text_bold)
+    ws_je.write(je_row, 7, "", fmt_text_bold)
+
+    # =====================================================================
+    # Tab 3: Detail (Source Data from billing engine)
+    # =====================================================================
+    ws_detail = wb.add_worksheet("Detail")
+    try:
+        detail_df = pd.read_excel(master_report_path, sheet_name="Source Data", dtype=object)
+        for c, col_name in enumerate(detail_df.columns):
+            ws_detail.write(0, c, col_name, fmt_header)
+            ws_detail.set_column(c, c, max(14, len(str(col_name)) + 2))
+        for r_idx, (_, row_data) in enumerate(detail_df.iterrows(), start=1):
+            for c_idx, val in enumerate(row_data):
+                if pd.isna(val):
+                    ws_detail.write(r_idx, c_idx, "", fmt_text)
+                else:
+                    try:
+                        float_val = float(val)
+                        ws_detail.write_number(r_idx, c_idx, float_val, fmt_money if "fee" in str(detail_df.columns[c_idx]).lower() else fmt_text)
+                    except (ValueError, TypeError):
+                        ws_detail.write(r_idx, c_idx, str(val), fmt_text)
+    except Exception as exc:
+        ws_detail.write(0, 0, f"Could not load billing detail: {exc}")
+        logger.warning("Failed to write Detail tab: %s", exc)
+
+    # =====================================================================
+    # Tab 4: Variance (prior-period accuracy, if available)
+    # =====================================================================
+    ws_var = wb.add_worksheet("Variance")
+    if prior_variance_df is not None and not prior_variance_df.empty:
+        ws_var.set_column("A:A", 30)
+        ws_var.set_column("B:D", 18)
+        ws_var.set_column("E:E", 14)
+        ws_var.set_column("F:F", 8)
+
+        ws_var.write(0, 0, "Prior-Period Accrual vs Actual (Estimate Accuracy)", fmt_title)
+        ws_var.write(1, 0, "Demonstrates reliability of the accrual methodology over time.", fmt_meta_val)
+
+        var_row = 3
+        for c, col_name in enumerate(prior_variance_df.columns):
+            ws_var.write(var_row, c, col_name, fmt_header)
+        var_row += 1
+
+        for _, data in prior_variance_df.iterrows():
+            is_total = str(data.get("Customer", "")) == "TOTAL"
+            text_fmt = fmt_text_bold if is_total else fmt_text
+            money_fmt = fmt_money_bold if is_total else fmt_money
+            for c, col_name in enumerate(prior_variance_df.columns):
+                val = data[col_name]
+                if col_name in ("Estimated", "Actual", "Variance"):
+                    ws_var.write_number(var_row, c, float(val) if pd.notna(val) else 0, money_fmt)
+                elif col_name == "Variance_Pct":
+                    ws_var.write_number(var_row, c, float(val) / 100.0 if pd.notna(val) else 0, fmt_pct)
+                elif col_name == "Flag":
+                    flag_str = str(val).strip() if pd.notna(val) else ""
+                    cell_fmt = fmt_warn if flag_str == "\u26a0" else (fmt_pass if flag_str == "\u2713" else text_fmt)
+                    ws_var.write(var_row, c, flag_str, cell_fmt)
+                else:
+                    ws_var.write(var_row, c, str(val) if pd.notna(val) else "", text_fmt)
+            var_row += 1
+    else:
+        ws_var.write(0, 0, "Variance — Prior-Period Accrual vs Actual", fmt_title)
+        ws_var.write(2, 0, "No prior-period variance data available yet.", fmt_meta_val)
+        ws_var.write(3, 0, "This tab will populate automatically once the first actual billing run completes", fmt_meta_val)
+        ws_var.write(4, 0, "and a variance report is generated. It demonstrates estimate accuracy over time.", fmt_meta_val)
+
+    wb.close()
+    logger.info("Wrote JE support workbook: %s", output_path)
+
+
 def run_accrual(
     accrual_month: date,
     usage_dir: Path,
@@ -268,14 +500,14 @@ def run_accrual(
     output_dir: Path,
     logger: logging.Logger,
     save_billing_detail: bool = False,
-) -> Tuple[Path, Path]:
+) -> Tuple[Path, Path, Path]:
     """
-    Run accrual: find prior-month usage, re-price with current rules, output JE CSV and accrual totals.
+    Run accrual: find prior-month usage, re-price with current rules, output JE CSV,
+    accrual totals, and a consolidated JE support workbook for controller review.
 
-    If save_billing_detail is True, copies the billing engine's Master Billing Report to output_dir
-    so you can inspect how fees were calculated (Audit & Controls, Executive Summary, Source Data).
+    If save_billing_detail is True, also copies the raw Master Billing Report to output_dir.
 
-    Returns (path_to_je_csv, path_to_accrual_totals_csv) for variance reporting.
+    Returns (path_to_je_csv, path_to_accrual_totals_csv, path_to_support_workbook).
     """
     usage_dir = usage_dir.resolve()
     rules_path = rules_path.resolve()
@@ -293,9 +525,7 @@ def run_accrual(
         inputs_dir.mkdir()
         outputs_dir = tmp_path / "outputs"
 
-        # Write usage CSV with prefix billing engine expects
         usage_csv = inputs_dir / "gepusage.csv"
-        # Billing engine normalizes to snake_case on read; keep columns as-is for compatibility
         df_usage.to_csv(usage_csv, index=False)
         config_copy = inputs_dir / rules_path.name
         shutil.copy2(rules_path, config_copy)
@@ -326,7 +556,6 @@ def run_accrual(
         je_path = output_dir / f"gep_accrual_JE_{accrual_month.year:04d}{accrual_month.month:02d}.csv"
         generate_journal_entry_csv(aggregated, accrual_month, je_path, logger)
 
-        # Accrual totals for variance report (customer, usage, next_day, minimums, total)
         totals_path = output_dir / f"gep_accrual_totals_{accrual_month.year:04d}{accrual_month.month:02d}.csv"
         totals_rows = [
             {
@@ -341,13 +570,26 @@ def run_accrual(
         pd.DataFrame(totals_rows).to_csv(totals_path, index=False)
         logger.info("Wrote accrual totals for variance: %s", totals_path)
 
+        # JE support workbook (consolidated for controller review)
+        prior_variance_df = _find_prior_variance(output_dir, accrual_month)
+        support_path = output_dir / f"gep_accrual_JE_support_{accrual_month.year:04d}{accrual_month.month:02d}.xlsx"
+        generate_je_support_workbook(
+            aggregated=aggregated,
+            accrual_month=accrual_month,
+            prior_usage_filename=prior_file.name,
+            master_report_path=master_path,
+            output_path=support_path,
+            logger=logger,
+            prior_variance_df=prior_variance_df,
+        )
+
         if save_billing_detail:
             detail_name = f"gep_accrual_billing_detail_{accrual_month.year:04d}{accrual_month.month:02d}.xlsx"
             detail_path = output_dir / detail_name
             shutil.copy2(master_path, detail_path)
             logger.info("Wrote billing detail (fee calculation) for review: %s", detail_path)
 
-    return (je_path, totals_path)
+    return (je_path, totals_path, support_path)
 
 
 # -----------------------------------------------------------------------------

@@ -434,10 +434,10 @@ def page_watcher_status() -> None:
 
     st.markdown("---")
     st.markdown("### Watcher Configuration")
-    st.markdown(f"- **Watching:** `{DEFAULT_INPUTS_DIR}`")
+    st.markdown("- **Usage source:** v3 query exports (watches for `YYYY.MM_*.csv`)")
     st.markdown(f"- **Outputs:** `{DEFAULT_OUTPUTS_DIR}`")
     st.markdown("- **Poll interval:** 30 minutes")
-    st.markdown("- **Accrual schedule:** auto-run on the 25th of each month")
+    st.markdown("- **Accrual schedule:** auto-run on the 25th of each month (uses prior month's file from same folder)")
     st.markdown(f"- **Ledger:** `{WATCHER_LEDGER}`")
 
 
@@ -456,10 +456,27 @@ def page_accruals() -> None:
     totals_files = sorted(ACCRUAL_OUTPUT_DIR.glob("gep_accrual_totals_*.csv"), reverse=True)
     variance_files = sorted(ACCRUAL_OUTPUT_DIR.glob("variance_*.csv"), reverse=True)
     detail_files = sorted(ACCRUAL_OUTPUT_DIR.glob("gep_accrual_billing_detail_*.xlsx"), reverse=True)
+    support_files = sorted(ACCRUAL_OUTPUT_DIR.glob("gep_accrual_JE_support_*.xlsx"), reverse=True)
 
     if not je_files and not totals_files and not variance_files:
         st.info("Accrual output directory exists but no results found yet.")
         return
+
+    # --- JE Support Workbook (primary deliverable for controller review) ---
+    if support_files:
+        latest_support = support_files[0]
+        period_str = latest_support.stem.replace("gep_accrual_JE_support_", "")
+        st.markdown("### JE Support Workbook")
+        st.caption(f"Consolidated support for {period_str[:4]}.{period_str[4:]} accrual — Summary, Journal Entry, Detail, and Variance tabs.")
+        st.download_button(
+            "Download JE Support Workbook",
+            data=latest_support.read_bytes(),
+            file_name=latest_support.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_accrual_support",
+            use_container_width=True,
+        )
+        st.markdown("---")
 
     # --- Accrual totals (most useful at a glance) ---
     if totals_files:

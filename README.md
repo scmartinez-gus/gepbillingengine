@@ -18,7 +18,7 @@ python3 billing_engine.py \
 
 ## Billing Watcher (automated runs)
 
-A background service that monitors the inputs folder for new usage files. When a `gepusage*.csv` appears, the watcher confirms the file is fully synced (stable file size across two consecutive polls), then runs the billing engine automatically.
+A background service that monitors the v3 usage queries folder for new `YYYY.MM_*.csv` files. When a new file appears and is confirmed stable (Google Drive sync finished), the billing engine runs automatically. The same folder is used for accruals — on the 25th of each month, the watcher grabs the prior month's file and generates the accrual JE.
 
 ### Start the watcher
 
@@ -26,11 +26,11 @@ A background service that monitors the inputs folder for new usage files. When a
 python3 billing_watcher.py
 ```
 
-This checks the default Google Drive inputs folder every 30 minutes. Outputs go to the default outputs folder. To customize:
+This watches the v3 query exports folder every 30 minutes. To customize:
 
 ```bash
 python3 billing_watcher.py \
-  --inputs-dir "/path/to/inputs" \
+  --usage-dir "/path/to/usage/csvs" \
   --outputs-dir "/path/to/outputs" \
   --poll-interval 900 \
   --slack-webhook "https://hooks.slack.com/services/..."
@@ -38,28 +38,25 @@ python3 billing_watcher.py \
 
 ### How it works
 
-1. Every N seconds (default 1800 = 30 min), the watcher lists the inputs folder for `gepusage*.csv` files.
+1. Every N seconds (default 1800 = 30 min), the watcher scans the usage directory for `YYYY.MM_*.csv` files.
 2. New files are held for one cycle to confirm the file size is stable (Google Drive sync is finished).
-3. Once stable, the billing engine runs and outputs are written (Master Report, NetSuite CSV, partner details).
+3. Once stable, the file is copied alongside the rules workbook into a temp directory and the billing engine runs. Outputs are written to the outputs folder (Master Report, NetSuite CSV, partner details).
 4. The file is recorded in a local ledger (`outputs/watcher_state/processed_files.json`) so it won't be processed again.
 5. If a Slack webhook is configured, a notification is sent with run status and audit outcome.
-
-### Automated accruals
-
-The watcher automatically runs the accrual engine on the 25th of each month (configurable with `--accrual-day`). It uses the prior month's usage file — the same one that was used for the previous month's actual bill — re-priced for the current month. The accrual only runs once per month; the result is tracked in the ledger.
-
-To disable: `--disable-accrual`. To change the trigger day: `--accrual-day 27`.
+6. On the 25th of each month, the watcher auto-runs the accrual engine using the prior month's file from the same folder, generating the JE support workbook, totals, and billing detail.
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--usage-dir` | v3 query exports | Directory to watch for `YYYY.MM_*.csv` usage files |
+| `--rules-dir` | Google Drive inputs | Directory containing `gep_billing_rules.xlsx` |
+| `--outputs-dir` | Google Drive outputs | Output directory for billing results |
 | `--poll-interval` | 1800 (30 min) | Seconds between folder checks |
 | `--slack-webhook` | `$BILLING_SLACK_WEBHOOK` | Slack webhook URL for notifications |
 | `--dry-run` | off | Detect files but don't run billing |
 | `--reset-ledger` | off | Clear the processed-files ledger and start fresh |
 | `--accrual-day` | 25 | Day of month to auto-run accruals |
-| `--usage-dir` | v3 query exports | Directory with prior-month usage CSVs for accrual |
 | `--accrual-output-dir` | `outputs/gep_accrual` | Output directory for accrual JE and totals |
 | `--disable-accrual` | off | Disable automatic accrual scheduling |
 | `--log-level` | INFO | DEBUG, INFO, WARNING, or ERROR |
