@@ -60,7 +60,10 @@ def _find_master_reports() -> List[Path]:
     """Return all Master Billing Reports sorted newest first."""
     if not BILLING_LOG_DIR.exists():
         return []
-    return sorted(BILLING_LOG_DIR.glob("*_Master_Billing_Report.xlsx"), reverse=True)
+    return sorted(
+        (p for p in BILLING_LOG_DIR.glob("*_Master_Billing_Report.xlsx") if not p.name.startswith("~$")),
+        reverse=True,
+    )
 
 
 def _read_audit_controls(report_path: Path) -> List[Dict[str, Any]]:
@@ -311,11 +314,11 @@ def page_overview() -> None:
         audit_df = pd.DataFrame(audit_rows)
         def _style_status(val):
             if str(val).upper() == "PASS":
-                return "background-color: #d4edda; color: #155724"
+                return "background-color: #F3FAFB; color: #0A8080"
             if str(val).upper() == "FAIL":
-                return "background-color: #f8d7da; color: #721c24"
+                return "background-color: #FFF3EF; color: #F45D48"
             if "REVIEW" in str(val).upper():
-                return "background-color: #fff3cd; color: #856404"
+                return "background-color: #FFF8E1; color: #7A5E00"
             return ""
         styled = audit_df.style.map(_style_status, subset=["Status"])
         st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -576,9 +579,9 @@ def page_accruals() -> None:
 
         def _style_flag(val):
             if str(val).strip() == "\u26a0":
-                return "background-color: #fff3cd; color: #856404"
+                return "background-color: #FFF8E1; color: #7A5E00"
             if str(val).strip() == "\u2713":
-                return "background-color: #d4edda; color: #155724"
+                return "background-color: #F3FAFB; color: #0A8080"
             return ""
 
         format_map = {c: "${:,.2f}" for c in ["Estimated", "Actual", "Variance"] if c in var_df.columns}
@@ -623,12 +626,134 @@ def page_accruals() -> None:
                 st.markdown(f"- `{f.name}`")
 
 
+_GUSTO_CSS = """
+<style>
+/* ---------- Gusto brand tokens ---------- */
+:root {
+    --guava-500: #F45D48;
+    --guava-100: #FFF3EF;
+    --kale-500: #0A8080;
+    --kale-100: #F3FAFB;
+    --salt-200: #FBFAFA;
+    --salt-400: #EAEAEA;
+    --salt-800: #6C6C72;
+    --salt-1000: #222525;
+    --parsnip-200: #F8F5F2;
+    --surface: #FFFFFF;
+    --amber-bg: #FFF8E1;
+    --amber-text: #7A5E00;
+}
+
+/* ---------- Metric cards ---------- */
+[data-testid="stMetric"] {
+    background: var(--surface);
+    border: 1px solid var(--salt-400);
+    border-radius: 8px;
+    padding: 16px 20px;
+}
+[data-testid="stMetricValue"] {
+    color: var(--kale-500);
+}
+[data-testid="stMetricLabel"] {
+    color: var(--salt-800);
+}
+
+/* ---------- Status banners ---------- */
+[data-testid="stAlert"] > div[data-testid="stAlertContentSuccess"] {
+    background: var(--kale-100);
+    border-left-color: var(--kale-500);
+    color: var(--salt-1000);
+}
+[data-testid="stAlert"] > div[data-testid="stAlertContentError"] {
+    background: var(--guava-100);
+    border-left-color: var(--guava-500);
+    color: var(--salt-1000);
+}
+[data-testid="stAlert"] > div[data-testid="stAlertContentWarning"] {
+    background: var(--amber-bg);
+    border-left-color: #E6A817;
+    color: var(--salt-1000);
+}
+[data-testid="stAlert"] > div[data-testid="stAlertContentInfo"] {
+    background: var(--kale-100);
+    border-left-color: var(--kale-500);
+    color: var(--salt-1000);
+}
+
+/* ---------- Section dividers ---------- */
+hr {
+    border: none;
+    border-top: 1px solid var(--salt-400);
+    margin: 1.5rem 0;
+}
+
+/* ---------- Download buttons ---------- */
+[data-testid="stDownloadButton"] > button {
+    background: var(--guava-500);
+    color: var(--surface);
+    border: none;
+    border-radius: 6px;
+    font-weight: 500;
+    transition: opacity 0.15s;
+}
+[data-testid="stDownloadButton"] > button:hover {
+    opacity: 0.85;
+    color: var(--surface);
+}
+[data-testid="stDownloadButton"] > button:active {
+    background: #D94A38;
+    color: var(--surface);
+}
+
+/* ---------- Tab bar ---------- */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    gap: 0;
+    border-bottom: 1px solid var(--salt-400);
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+    padding: 10px 24px;
+    font-weight: 500;
+    color: var(--salt-800);
+}
+
+/* ---------- Dataframes / tables ---------- */
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--salt-400);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+/* ---------- Code blocks (watcher log) ---------- */
+[data-testid="stCode"] code {
+    background: var(--parsnip-200);
+}
+
+/* ---------- Expander ---------- */
+[data-testid="stExpander"] {
+    border: 1px solid var(--salt-400);
+    border-radius: 8px;
+}
+
+/* ---------- Title & caption ---------- */
+h1 {
+    color: var(--salt-1000);
+    font-weight: 600;
+}
+.stCaption, [data-testid="stCaptionContainer"] {
+    color: var(--salt-800);
+}
+</style>
+"""
+
+
 def main() -> None:
     st.set_page_config(
         page_title="GEP Billing Dashboard",
         page_icon="\U0001f4ca",
         layout="wide",
     )
+
+    st.markdown(_GUSTO_CSS, unsafe_allow_html=True)
 
     st.title("GEP Billing Dashboard")
     st.caption("Automated billing monitoring — no uploads, no buttons. Just results.")
