@@ -445,6 +445,64 @@ def select_tier_for_value(tiers: List[Tier], value: float) -> Optional[Tier]:
     return max(tiers, key=lambda tier: tier.start)
 
 
+DQ_FLAG_COLUMNS = [
+    "PARTNER_NAME",
+    "ER_NAME",
+    "ER_ID",
+    "COMPANY_UUID",
+    "FIRST_BILLABLE_ACTIVITY_DATE",
+    "SUSPENSION_DATE",
+    "DISSOCIATION_DATE",
+    "TOTAL_INDIVIDUAL_USERS",
+    "total_fee",
+    "FLAG_REASON",
+]
+
+
+def build_data_quality_flags(master_df: pd.DataFrame) -> pd.DataFrame:
+    """Flag usage rows that need human review.
+
+    Two checks (minimums are excluded):
+    1. Missing FIRST_BILLABLE_ACTIVITY_DATE — no billing trigger recorded.
+    2. SUSPENSION_DATE or DISSOCIATION_DATE <= FIRST_BILLABLE_ACTIVITY_DATE —
+       company may have cancelled before committing.
+    """
+    usage = master_df[
+        master_df["row_type"].fillna("").str.lower() != "min_trueup"
+    ].copy()
+
+    if usage.empty:
+        return pd.DataFrame(columns=DQ_FLAG_COLUMNS)
+
+    flags: list[dict] = []
+
+    for _, row in usage.iterrows():
+        fba = parse_date(row.get("FIRST_BILLABLE_ACTIVITY_DATE"))
+
+        if fba is None:
+            flags.append({**row, "FLAG_REASON": "Missing FIRST_BILLABLE_ACTIVITY_DATE"})
+            continue
+
+        reasons = []
+        susp = parse_date(row.get("SUSPENSION_DATE"))
+        diss = parse_date(row.get("DISSOCIATION_DATE"))
+
+        if susp is not None and susp <= fba:
+            reasons.append(f"SUSPENSION_DATE ({format_date_mdy_yy(susp)}) <= FIRST_BILLABLE_ACTIVITY_DATE ({format_date_mdy_yy(fba)})")
+        if diss is not None and diss <= fba:
+            reasons.append(f"DISSOCIATION_DATE ({format_date_mdy_yy(diss)}) <= FIRST_BILLABLE_ACTIVITY_DATE ({format_date_mdy_yy(fba)})")
+
+        if reasons:
+            flags.append({**row, "FLAG_REASON": "; ".join(reasons)})
+
+    if not flags:
+        return pd.DataFrame(columns=DQ_FLAG_COLUMNS)
+
+    flag_df = pd.DataFrame(flags)
+    present = [c for c in DQ_FLAG_COLUMNS if c in flag_df.columns]
+    return flag_df[present].reset_index(drop=True)
+
+
 def detect_usage_file(inputs_dir: Path, usage_prefix: str, logger: logging.Logger) -> Path:
     """Find newest usage CSV file whose name starts with usage_prefix."""
     if not inputs_dir.exists() or not inputs_dir.is_dir():
@@ -759,6 +817,7 @@ def generate_master_billing_report(
     netsuite_df: pd.DataFrame,
     input_metrics: dict,
     output_path: Path,
+    dq_flags: Optional[pd.DataFrame] = None,
 ) -> None:
     """Create a three-tab master billing dashboard workbook with audit controls."""
     data = df_usage.copy()
@@ -969,6 +1028,17 @@ def generate_master_billing_report(
             "Status": "PASS" if exception_rows == 0 else "REVIEW REQUIRED",
         },
     ]
+
+    dq_flag_count = len(dq_flags) if dq_flags is not None else 0
+    audit_rows.append(
+        {
+            "Control Check": "Data Quality Flags",
+            "Input": 0,
+            "Output": dq_flag_count,
+            "Variance": dq_flag_count,
+            "Status": "PASS" if dq_flag_count == 0 else "REVIEW REQUIRED",
+        }
+    )
     audit_df = pd.DataFrame(
         audit_rows,
         columns=["Control Check", "Input", "Output", "Variance", "Status"],
@@ -1035,6 +1105,16 @@ def generate_master_billing_report(
 
         ws_source.set_row(0, None, header_fmt)
         ws_source.freeze_panes(1, 0)
+
+        if dq_flags is not None and not dq_flags.empty:
+            dq_flags.to_excel(writer, sheet_name="Data Quality Flags", index=False)
+            ws_dq = writer.sheets["Data Quality Flags"]
+            ws_dq.set_row(0, None, header_fmt)
+            ws_dq.freeze_panes(1, 0)
+            for col_idx, col_name in enumerate(dq_flags.columns):
+                val_strings = [str(v) for v in dq_flags[col_name].fillna("").tolist()]
+                width = max([len(str(col_name))] + [len(v) for v in val_strings]) + 2
+                ws_dq.set_column(col_idx, col_idx, max(12, min(50, width)))
 
 
 def _build_partner_lookups(
@@ -1733,6 +1813,12 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     output_columns = order_columns(out_rows)
     master_df = pd.DataFrame(out_rows, columns=output_columns)
 
+    dq_flags = build_data_quality_flags(master_df)
+    if not dq_flags.empty:
+        logger.info("Data quality flags: %d row(s) flagged for review", len(dq_flags))
+    else:
+        logger.info("Data quality flags: none — all rows clean")
+
     billing_period = f"{for_month_any.year:04d}.{for_month_any.month:02d}"
     rules_snapshot_name = (
         f"rules_snapshot_{billing_period.replace('.', '-')}_{run_id}{config_path.suffix or '.xlsx'}"
@@ -1744,7 +1830,7 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
 
     history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
-    generate_master_billing_report(master_df, netsuite_df, input_metrics, history_file_path)
+    generate_master_billing_report(master_df, netsuite_df, input_metrics, history_file_path, dq_flags=dq_flags)
     logger.info("Wrote master billing report: %s", history_file_path)
 
     _write_partner_detail_files(master_df, partner_dir, for_month_any, usage_source_columns, logger)

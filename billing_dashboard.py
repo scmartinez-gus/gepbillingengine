@@ -97,6 +97,19 @@ def _read_executive_summary(report_path: Path) -> Optional[pd.DataFrame]:
         return None
 
 
+def _read_data_quality_flags(report_path: Path) -> Optional[pd.DataFrame]:
+    if not report_path.exists():
+        return None
+    try:
+        wb = load_workbook(report_path, data_only=True)
+        if "Data Quality Flags" not in wb.sheetnames:
+            return pd.DataFrame()
+        df = pd.read_excel(report_path, sheet_name="Data Quality Flags")
+        return df
+    except Exception:
+        return None
+
+
 def _audit_status(audit_rows: List[Dict[str, Any]]) -> str:
     statuses = [str(row.get("Status", "")).upper() for row in audit_rows]
     if any(s == "FAIL" for s in statuses):
@@ -308,6 +321,27 @@ def page_overview() -> None:
         st.dataframe(styled, use_container_width=True, hide_index=True)
     else:
         st.warning("No audit data found in the latest report.")
+
+    dq_flags = _read_data_quality_flags(latest_report)
+    if dq_flags is not None and not dq_flags.empty:
+        st.markdown("---")
+        st.markdown("### Data Quality Flags")
+        st.warning(
+            f"**{len(dq_flags)} row(s)** flagged for review. "
+            "These are usage rows with missing billing triggers or early cancellation dates. "
+            "Please investigate before finalizing invoices."
+        )
+
+        reason_counts = dq_flags["FLAG_REASON"].apply(
+            lambda r: "Missing FIRST_BILLABLE_ACTIVITY_DATE"
+            if "Missing" in str(r)
+            else "Suspension/Dissociation before billing start"
+        ).value_counts()
+        cols = st.columns(len(reason_counts))
+        for i, (reason, count) in enumerate(reason_counts.items()):
+            cols[i].metric(reason, count)
+
+        st.dataframe(dq_flags, use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("### Executive Summary by Partner")
