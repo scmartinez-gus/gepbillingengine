@@ -458,6 +458,25 @@ DQ_FLAG_COLUMNS = [
     "FLAG_REASON",
 ]
 
+# Pre-scan flag types for the Data Triage Gate.
+FLAG_MISSING_BILLING_TRIGGER = "missing_billing_trigger"
+FLAG_EARLY_CANCELLATION = "early_cancellation"
+FLAG_DUPLICATE_UUID = "duplicate_uuid"
+FLAG_UNMAPPED_PARTNER = "unmapped_partner"
+FLAG_MISSING_TIER = "missing_tier"
+
+FLAG_AVAILABLE_ACTIONS: Dict[str, List[str]] = {
+    FLAG_MISSING_BILLING_TRIGGER: ["remove", "keep"],
+    FLAG_EARLY_CANCELLATION: ["remove", "keep"],
+    FLAG_DUPLICATE_UUID: ["remove", "reassign", "keep"],
+    FLAG_UNMAPPED_PARTNER: ["remove", "keep"],
+    FLAG_MISSING_TIER: ["remove", "keep"],
+}
+
+DATA_REVIEW_DIR_NAME = "gep_data_review"
+PRE_SCAN_RESULTS_FILE = "pre_scan_results.json"
+BILLING_OVERRIDES_FILE = "billing_overrides.json"
+
 
 def build_data_quality_flags(master_df: pd.DataFrame) -> pd.DataFrame:
     """Flag usage rows that need human review.
@@ -818,6 +837,7 @@ def generate_master_billing_report(
     input_metrics: dict,
     output_path: Path,
     dq_flags: Optional[pd.DataFrame] = None,
+    override_audit_log: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Create a three-tab master billing dashboard workbook with audit controls."""
     data = df_usage.copy()
@@ -1115,6 +1135,27 @@ def generate_master_billing_report(
                 val_strings = [str(v) for v in dq_flags[col_name].fillna("").tolist()]
                 width = max([len(str(col_name))] + [len(v) for v in val_strings]) + 2
                 ws_dq.set_column(col_idx, col_idx, max(12, min(50, width)))
+
+        if override_audit_log:
+            overrides_df = pd.DataFrame(override_audit_log, columns=[
+                "Action", "ER_NAME", "COMPANY_UUID",
+                "Original Partner", "New Partner",
+                "Original Date", "New Date",
+            ])
+            overrides_df.to_excel(
+                writer, sheet_name="Overrides Applied", index=False,
+            )
+            ws_ov = writer.sheets["Overrides Applied"]
+            ws_ov.set_row(0, None, header_fmt)
+            ws_ov.freeze_panes(1, 0)
+            for col_idx, col_name in enumerate(overrides_df.columns):
+                val_strings = [
+                    str(v) for v in overrides_df[col_name].fillna("").tolist()
+                ]
+                width = max(
+                    [len(str(col_name))] + [len(v) for v in val_strings]
+                ) + 2
+                ws_ov.set_column(col_idx, col_idx, max(14, min(40, width)))
 
 
 def _build_partner_lookups(
@@ -1420,7 +1461,515 @@ def _write_partner_detail_files(
         logger.info("Wrote partner detail file: %s", file_path)
 
 
-def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, config_filename: str, logger: logging.Logger) -> None:
+# ---------------------------------------------------------------------------
+# Data Triage Gate — pre-scan and overrides
+# ---------------------------------------------------------------------------
+
+def _build_flag(
+    flag_id: str,
+    flag_type: str,
+    flag_reason: str,
+    row: Dict[str, Any],
+    row_index: int,
+    *,
+    scope: str = "row",
+    partner_key: str = "",
+    affected_row_indices: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Build a single flag entry for pre-scan results."""
+    entry: Dict[str, Any] = {
+        "flag_id": flag_id,
+        "flag_type": flag_type,
+        "flag_reason": flag_reason,
+        "available_actions": FLAG_AVAILABLE_ACTIONS.get(flag_type, ["keep"]),
+        "scope": scope,
+        "row_index": row_index,
+        "COMPANY_UUID": key(row.get("COMPANY_UUID")),
+        "ER_NAME": key(row.get("ER_NAME")),
+        "ER_ID": key(row.get("ER_ID")),
+        "PARTNER_NAME": key(row.get("PARTNER_NAME")),
+        "PARTNER_ID": key(row.get("PARTNER_ID")),
+        "TOTAL_INDIVIDUAL_USERS": key(row.get("TOTAL_INDIVIDUAL_USERS")),
+        "FIRST_BILLABLE_ACTIVITY_DATE": format_date_mdy_yy(
+            parse_date(row.get("FIRST_BILLABLE_ACTIVITY_DATE"))
+        ),
+    }
+    if scope == "partner":
+        entry["partner_key"] = partner_key
+        entry["affected_row_indices"] = affected_row_indices or []
+    return entry
+
+
+def run_pre_scan(
+    inputs_dir: Path,
+    outputs_dir: Path,
+    usage_prefix: str,
+    config_filename: str,
+    logger: logging.Logger,
+) -> Path:
+    """Run data quality pre-scan and save results for human review.
+
+    Loads usage data and rules, runs the five triage checks, and writes
+    pre_scan_results.json.  Returns the path to that file.
+    """
+    scan_started_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    usage_file = detect_usage_file(inputs_dir, usage_prefix, logger)
+    config_path = inputs_dir / config_filename
+    if not config_path.exists():
+        raise BillingEngineError(f"Config workbook not found: {config_path}")
+
+    usage_file_hash = file_sha256(usage_file)
+    rules_file_hash = file_sha256(config_path)
+
+    logger.info("Pre-scan: loading usage CSV...")
+    usage_df = pd.read_csv(usage_file, dtype=object)
+    usage_df = normalize_dataframe_columns(usage_df)
+    if usage_df.empty:
+        raise BillingEngineError(f"Usage file is empty: {usage_file}")
+
+    if "partner_name" not in usage_df.columns:
+        usage_df["partner_name"] = ""
+    if "first_billable_activity_date" not in usage_df.columns:
+        usage_df["first_billable_activity_date"] = pd.NaT
+    usage_df["first_billable_activity_date"] = usage_df[
+        "first_billable_activity_date"
+    ].apply(parse_date)
+    usage_df["first_billable_activity_date"] = pd.to_datetime(
+        usage_df["first_billable_activity_date"], errors="coerce"
+    )
+    usage_df = usage_df.sort_values(
+        by=["partner_name", "first_billable_activity_date"],
+        ascending=[True, True],
+    ).reset_index(drop=True)
+
+    usage_rows = canonicalize_usage_rows(usage_df)
+
+    logger.info("Pre-scan: loading rules workbook...")
+    sheets = load_rules_workbook(config_path)
+    pricing_df = sheets[SHEET_PRICING]
+    mapping_df = sheets[SHEET_MAPPING]
+
+    # Build mapping lookup for unmapped-partner check.
+    ns_map_by_clean_id: Dict[str, str] = {}
+    ns_map_by_name: Dict[str, str] = {}
+    ns_map_by_partner_key: Dict[str, str] = {}
+    for row in mapping_df.to_dict(orient="records"):
+        pid = key(row.get("partner_id"))
+        pname = lower_key(row.get("partner_name"))
+        cust = key(
+            value_from_aliases(
+                row, ["ns_customer_name", "netsuite_customer_name", "customer_name"]
+            )
+        )
+        if not cust:
+            continue
+        cleaned = clean_id(pid)
+        if cleaned:
+            ns_map_by_clean_id[cleaned] = cust
+        if pname:
+            ns_map_by_name[pname] = cust
+        p_key = pricing_partner_key(row)
+        if p_key:
+            ns_map_by_partner_key[p_key] = cust
+
+    # Build tier-exists lookup for missing-tier check.
+    tier_exists_by_partner: Dict[str, bool] = {}
+    for row in pricing_df.to_dict(orient="records"):
+        p_key = pricing_partner_key(row)
+        if p_key:
+            tier_exists_by_partner[p_key] = True
+
+    # Collect all partners for the reassignment dropdown.
+    all_partners: Dict[str, Dict[str, str]] = {}
+    for row in usage_rows:
+        p_name = key(row.get("PARTNER_NAME"))
+        p_id = key(row.get("PARTNER_ID"))
+        p_key = usage_partner_key(row)
+        if p_key and p_name:
+            all_partners.setdefault(
+                p_key, {"partner_name": p_name, "partner_id": p_id}
+            )
+
+    # ------------------------------------------------------------------
+    # Run all five flag checks
+    # ------------------------------------------------------------------
+    flags: List[Dict[str, Any]] = []
+    flag_counter = 0
+
+    # Track UUIDs for duplicate check.
+    uuid_to_row_indices: Dict[str, List[int]] = {}
+    uuid_to_partners: Dict[str, set] = {}
+
+    # Track partners for per-partner flags.
+    partner_row_indices: Dict[str, List[int]] = {}
+    checked_unmapped: set = set()
+    checked_missing_tier: set = set()
+
+    for idx, row in enumerate(usage_rows):
+        company_uuid = key(row.get("COMPANY_UUID"))
+        p_key = usage_partner_key(row)
+        c_key = usage_company_key(row)
+        p_name = key(row.get("PARTNER_NAME"))
+
+        if p_key:
+            partner_row_indices.setdefault(p_key, []).append(idx)
+
+        if company_uuid:
+            uuid_to_row_indices.setdefault(company_uuid, []).append(idx)
+            uuid_to_partners.setdefault(company_uuid, set()).add(p_name or p_key)
+
+        # Check 1: Missing billing trigger.
+        fba = parse_date(row.get("FIRST_BILLABLE_ACTIVITY_DATE"))
+        if fba is None:
+            flags.append(_build_flag(
+                flag_id=f"missing_fba_{flag_counter}",
+                flag_type=FLAG_MISSING_BILLING_TRIGGER,
+                flag_reason="Missing FIRST_BILLABLE_ACTIVITY_DATE",
+                row=row, row_index=idx,
+            ))
+            flag_counter += 1
+            continue
+
+        # Check 2: Early cancellation.
+        reasons: list[str] = []
+        susp = parse_date(row.get("SUSPENSION_DATE"))
+        diss = parse_date(row.get("DISSOCIATION_DATE"))
+        if susp is not None and susp <= fba:
+            reasons.append(
+                f"SUSPENSION_DATE ({format_date_mdy_yy(susp)}) "
+                f"<= FIRST_BILLABLE_ACTIVITY_DATE ({format_date_mdy_yy(fba)})"
+            )
+        if diss is not None and diss <= fba:
+            reasons.append(
+                f"DISSOCIATION_DATE ({format_date_mdy_yy(diss)}) "
+                f"<= FIRST_BILLABLE_ACTIVITY_DATE ({format_date_mdy_yy(fba)})"
+            )
+        if reasons:
+            flags.append(_build_flag(
+                flag_id=f"early_cancel_{flag_counter}",
+                flag_type=FLAG_EARLY_CANCELLATION,
+                flag_reason="; ".join(reasons),
+                row=row, row_index=idx,
+            ))
+            flag_counter += 1
+
+        # Check 5: Missing tier / bad data (per-row for bad data, per-partner
+        # for missing tier — but we only flag the partner once).
+        if not p_key or not c_key:
+            flags.append(_build_flag(
+                flag_id=f"bad_data_{flag_counter}",
+                flag_type=FLAG_MISSING_TIER,
+                flag_reason="Missing PARTNER_ID/PARTNER_NAME and/or ER_ID/ER_NAME",
+                row=row, row_index=idx,
+            ))
+            flag_counter += 1
+
+    # Check 3: Duplicate UUIDs (same UUID under different partners).
+    for company_uuid, partner_set in uuid_to_partners.items():
+        if len(partner_set) <= 1:
+            continue
+        partner_list = sorted(partner_set)
+        for row_idx in uuid_to_row_indices[company_uuid]:
+            flags.append(_build_flag(
+                flag_id=f"dup_uuid_{flag_counter}",
+                flag_type=FLAG_DUPLICATE_UUID,
+                flag_reason=(
+                    f"COMPANY_UUID '{company_uuid}' appears under "
+                    f"multiple partners: {', '.join(partner_list)}"
+                ),
+                row=usage_rows[row_idx], row_index=row_idx,
+            ))
+            flag_counter += 1
+
+    # Check 4: Unmapped partner (one flag per partner).
+    for p_key, row_indices in partner_row_indices.items():
+        if p_key in checked_unmapped:
+            continue
+        checked_unmapped.add(p_key)
+        first_row = usage_rows[row_indices[0]]
+        cleaned_pid = clean_id(first_row.get("PARTNER_ID"))
+        ns_name = (
+            (ns_map_by_clean_id.get(cleaned_pid, "") if cleaned_pid else "")
+            or ns_map_by_name.get(lower_key(first_row.get("PARTNER_NAME")), "")
+            or ns_map_by_partner_key.get(p_key, "")
+        )
+        if not ns_name:
+            flags.append(_build_flag(
+                flag_id=f"unmapped_{flag_counter}",
+                flag_type=FLAG_UNMAPPED_PARTNER,
+                flag_reason=(
+                    f"No NetSuite customer mapping for partner "
+                    f"'{key(first_row.get('PARTNER_NAME')) or p_key}'"
+                ),
+                row=first_row, row_index=row_indices[0],
+                scope="partner", partner_key=p_key,
+                affected_row_indices=row_indices,
+            ))
+            flag_counter += 1
+
+    # Check 5 (partner-level): Missing pricing tier.
+    for p_key, row_indices in partner_row_indices.items():
+        if p_key in checked_missing_tier or p_key in tier_exists_by_partner:
+            continue
+        checked_missing_tier.add(p_key)
+        first_row = usage_rows[row_indices[0]]
+        flags.append(_build_flag(
+            flag_id=f"missing_tier_{flag_counter}",
+            flag_type=FLAG_MISSING_TIER,
+            flag_reason=(
+                f"No pricing tier found for partner "
+                f"'{key(first_row.get('PARTNER_NAME')) or p_key}'"
+            ),
+            row=first_row, row_index=row_indices[0],
+            scope="partner", partner_key=p_key,
+            affected_row_indices=row_indices,
+        ))
+        flag_counter += 1
+
+    # Build partner-company roster for the dashboard.
+    partner_company_roster: Dict[str, List[Dict[str, Any]]] = {}
+    for idx, row in enumerate(usage_rows):
+        p_name = (
+            key(row.get("PARTNER_NAME"))
+            or key(row.get("PARTNER_ID"))
+            or "Unknown"
+        )
+        partner_company_roster.setdefault(p_name, []).append({
+            "row_index": idx,
+            "COMPANY_UUID": key(row.get("COMPANY_UUID")),
+            "ER_NAME": key(row.get("ER_NAME")),
+            "ER_ID": key(row.get("ER_ID")),
+            "TOTAL_INDIVIDUAL_USERS": key(row.get("TOTAL_INDIVIDUAL_USERS")),
+        })
+
+    # Determine FOR_MONTH from the first valid row.
+    for_month_str = ""
+    for row in usage_rows:
+        fm = (
+            row.get("FOR_MONTH")
+            if not is_missing(row.get("FOR_MONTH"))
+            else row.get("for_month")
+        )
+        parsed_fm = parse_date(fm)
+        if parsed_fm:
+            for_month_str = f"{parsed_fm.year:04d}.{parsed_fm.month:02d}"
+            break
+
+    flags_by_type: Dict[str, int] = {}
+    for flag in flags:
+        t = flag["flag_type"]
+        flags_by_type[t] = flags_by_type.get(t, 0) + 1
+
+    status = "review_required" if flags else "clean"
+
+    results = {
+        "scan_timestamp_utc": scan_started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "usage_file": {
+            "path": str(usage_file),
+            "name": usage_file.name,
+            "sha256": usage_file_hash,
+        },
+        "rules_file": {
+            "path": str(config_path),
+            "sha256": rules_file_hash,
+        },
+        "for_month": for_month_str,
+        "total_usage_rows": len(usage_rows),
+        "total_flags": len(flags),
+        "flags_by_type": flags_by_type,
+        "flags": flags,
+        "all_partners": [
+            {"partner_key": pk, **pv}
+            for pk, pv in sorted(
+                all_partners.items(),
+                key=lambda x: x[1].get("partner_name", ""),
+            )
+        ],
+        "partner_company_roster": partner_company_roster,
+        "status": status,
+    }
+
+    review_dir = outputs_dir / DATA_REVIEW_DIR_NAME
+    review_dir.mkdir(parents=True, exist_ok=True)
+
+    overrides_path = review_dir / BILLING_OVERRIDES_FILE
+    if overrides_path.exists():
+        overrides_path.unlink()
+        logger.info("Cleared stale overrides file from previous scan.")
+
+    results_path = review_dir / PRE_SCAN_RESULTS_FILE
+    with results_path.open("w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, default=str)
+
+    logger.info(
+        "Pre-scan complete: %d flag(s) across %d row(s). Results: %s",
+        len(flags), len(usage_rows), results_path,
+    )
+    return results_path
+
+
+def apply_billing_overrides(
+    usage_rows: List[Dict[str, Any]],
+    overrides_path: Path,
+    usage_file_hash: str,
+    logger: logging.Logger,
+) -> tuple:
+    """Apply human-reviewed overrides to usage rows before fee computation.
+
+    Returns (modified_rows, override_audit_log).  The audit log is a list of
+    dicts suitable for writing to the master report's Overrides Applied sheet.
+    Raises BillingEngineError if the overrides hash doesn't match.
+    """
+    if not overrides_path.exists():
+        return usage_rows, []
+
+    with overrides_path.open("r", encoding="utf-8") as f:
+        overrides = json.load(f)
+
+    saved_hash = overrides.get("usage_file_sha256", "")
+    if saved_hash and saved_hash != usage_file_hash:
+        raise BillingEngineError(
+            f"Billing overrides were created for a different usage file "
+            f"(expected {usage_file_hash[:16]}…, got {saved_hash[:16]}…). "
+            f"Re-run the pre-scan to generate fresh overrides."
+        )
+
+    decisions = overrides.get("decisions", [])
+    if not decisions:
+        logger.info("Overrides file present but contains no decisions.")
+        return usage_rows, []
+
+    # Collect per-row actions.
+    remove_indices: set = set()
+    reassign_map: Dict[int, Dict[str, str]] = {}
+    set_date_map: Dict[int, str] = {}
+
+    for d in decisions:
+        action = d.get("action", "keep")
+        scope = d.get("scope", "row")
+
+        if action == "remove":
+            if scope == "partner":
+                for ri in d.get("affected_row_indices", []):
+                    remove_indices.add(int(ri))
+            else:
+                ri = d.get("row_index")
+                if ri is not None:
+                    remove_indices.add(int(ri))
+
+        elif action in ("reassign", "set_date_and_reassign"):
+            target = {
+                "partner_name": d.get("reassign_to_partner_name", ""),
+                "partner_id": d.get("reassign_to_partner_id", ""),
+            }
+            if scope == "partner":
+                for ri in d.get("affected_row_indices", []):
+                    reassign_map[int(ri)] = target
+            else:
+                ri = d.get("row_index")
+                if ri is not None:
+                    reassign_map[int(ri)] = target
+
+        if action in ("set_date", "set_date_and_reassign"):
+            date_val = d.get("set_date", "")
+            if date_val:
+                ri = d.get("row_index")
+                if ri is not None:
+                    set_date_map[int(ri)] = date_val
+
+    result: List[Dict[str, Any]] = []
+    audit_log: List[Dict[str, Any]] = []
+    removed_count = 0
+    reassigned_count = 0
+    date_set_count = 0
+
+    for idx, row in enumerate(usage_rows):
+        er_name = key(row.get("ER_NAME"))
+        partner_name = key(row.get("PARTNER_NAME"))
+        company_uuid = key(row.get("COMPANY_UUID"))
+
+        if idx in remove_indices:
+            removed_count += 1
+            audit_log.append({
+                "Action": "Removed",
+                "ER_NAME": er_name,
+                "COMPANY_UUID": company_uuid,
+                "Original Partner": partner_name,
+                "New Partner": "",
+                "Original Date": key(row.get("FIRST_BILLABLE_ACTIVITY_DATE")),
+                "New Date": "",
+            })
+            logger.info(
+                "Override: REMOVED row %d (ER_NAME='%s', PARTNER='%s', UUID='%s')",
+                idx, er_name, partner_name, company_uuid,
+            )
+            continue
+
+        changes: List[str] = []
+
+        if idx in reassign_map:
+            target = reassign_map[idx]
+            old_partner = partner_name
+            if target["partner_name"]:
+                row["PARTNER_NAME"] = target["partner_name"]
+            if target["partner_id"]:
+                row["PARTNER_ID"] = target["partner_id"]
+            reassigned_count += 1
+            new_partner = target["partner_name"] or target["partner_id"]
+            changes.append(f"Partner: {old_partner} -> {new_partner}")
+            logger.info(
+                "Override: REASSIGNED row %d (ER_NAME='%s') from '%s' to '%s'",
+                idx, er_name, old_partner, new_partner,
+            )
+
+        old_date = ""
+        new_date = ""
+        if idx in set_date_map:
+            old_date = key(row.get("FIRST_BILLABLE_ACTIVITY_DATE"))
+            new_date = set_date_map[idx]
+            row["FIRST_BILLABLE_ACTIVITY_DATE"] = new_date
+            date_set_count += 1
+            changes.append(f"Date: {old_date or '(missing)'} -> {new_date}")
+            logger.info(
+                "Override: SET DATE row %d (ER_NAME='%s') "
+                "FIRST_BILLABLE_ACTIVITY_DATE '%s' -> '%s'",
+                idx, er_name, old_date, new_date,
+            )
+
+        if changes:
+            audit_log.append({
+                "Action": "Modified",
+                "ER_NAME": er_name,
+                "COMPANY_UUID": company_uuid,
+                "Original Partner": partner_name if idx in reassign_map else "",
+                "New Partner": (
+                    reassign_map[idx].get("partner_name", "")
+                    if idx in reassign_map else ""
+                ),
+                "Original Date": old_date,
+                "New Date": new_date,
+            })
+
+        result.append(row)
+
+    logger.info(
+        "Overrides applied: %d removed, %d reassigned, %d dates set, %d unchanged",
+        removed_count, reassigned_count, date_set_count,
+        len(usage_rows) - removed_count - reassigned_count - date_set_count,
+    )
+    return result, audit_log
+
+
+def run_billing_engine(
+    inputs_dir: Path,
+    outputs_dir: Path,
+    usage_prefix: str,
+    config_filename: str,
+    logger: logging.Logger,
+    *,
+    overrides_path: Optional[Path] = None,
+) -> None:
     """Main workflow execution."""
     run_started_at = datetime.now(timezone.utc).replace(microsecond=0)
     run_id = run_started_at.strftime("%Y%m%dT%H%M%SZ")
@@ -1488,6 +2037,27 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     mapping_df = sheets[SHEET_MAPPING]
 
     usage_rows = canonicalize_usage_rows(usage_df)
+
+    # Apply human-reviewed overrides if present.
+    override_audit_log: List[Dict[str, Any]] = []
+    effective_overrides = overrides_path
+    if effective_overrides is None:
+        candidate = outputs_dir / DATA_REVIEW_DIR_NAME / BILLING_OVERRIDES_FILE
+        if candidate.exists():
+            effective_overrides = candidate
+    if effective_overrides is not None and effective_overrides.exists():
+        logger.info("Applying billing overrides from %s", effective_overrides)
+        usage_rows, override_audit_log = apply_billing_overrides(
+            usage_rows, effective_overrides, usage_file_hash, logger,
+        )
+        input_row_count = len(usage_rows)
+        input_total_users = sum(
+            num(r.get("TOTAL_INDIVIDUAL_USERS")) for r in usage_rows
+        )
+        input_metrics = {
+            "row_count": input_row_count,
+            "total_users": input_total_users,
+        }
 
     logger.info("Building partner lookups...")
     lookups = _build_partner_lookups(mapping_df, config_df, minimums_df, pricing_df, usage_rows, logger)
@@ -1830,7 +2400,10 @@ def run_billing_engine(inputs_dir: Path, outputs_dir: Path, usage_prefix: str, c
     logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
 
     history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
-    generate_master_billing_report(master_df, netsuite_df, input_metrics, history_file_path, dq_flags=dq_flags)
+    generate_master_billing_report(
+        master_df, netsuite_df, input_metrics, history_file_path,
+        dq_flags=dq_flags, override_audit_log=override_audit_log,
+    )
     logger.info("Wrote master billing report: %s", history_file_path)
 
     _write_partner_detail_files(master_df, partner_dir, for_month_any, usage_source_columns, logger)
@@ -1899,6 +2472,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level.",
     )
+    parser.add_argument(
+        "--pre-scan",
+        action="store_true",
+        help="Run data quality pre-scan only (no billing). Writes pre_scan_results.json.",
+    )
+    parser.add_argument(
+        "--overrides",
+        default=None,
+        help="Path to billing_overrides.json (optional; auto-detected from outputs dir).",
+    )
     return parser
 
 
@@ -1917,13 +2500,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     outputs_dir = Path(args.outputs_dir).resolve()
 
     try:
-        run_billing_engine(
-            inputs_dir=inputs_dir,
-            outputs_dir=outputs_dir,
-            usage_prefix=args.usage_prefix,
-            config_filename=args.config_file,
-            logger=logger,
-        )
+        if args.pre_scan:
+            results_path = run_pre_scan(
+                inputs_dir=inputs_dir,
+                outputs_dir=outputs_dir,
+                usage_prefix=args.usage_prefix,
+                config_filename=args.config_file,
+                logger=logger,
+            )
+            logger.info("Pre-scan results written to: %s", results_path)
+        else:
+            overrides_path = Path(args.overrides) if args.overrides else None
+            run_billing_engine(
+                inputs_dir=inputs_dir,
+                outputs_dir=outputs_dir,
+                usage_prefix=args.usage_prefix,
+                config_filename=args.config_file,
+                logger=logger,
+                overrides_path=overrides_path,
+            )
     except BillingEngineError as exc:
         logger.error("%s", exc)
         return 2

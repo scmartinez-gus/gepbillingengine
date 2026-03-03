@@ -21,12 +21,24 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-from billing_engine import DEFAULT_INPUTS_DIR, DEFAULT_OUTPUTS_DIR
+from billing_engine import (
+    BILLING_OVERRIDES_FILE,
+    DATA_REVIEW_DIR_NAME,
+    DEFAULT_INPUTS_DIR,
+    DEFAULT_OUTPUTS_DIR,
+    FLAG_DUPLICATE_UUID,
+    FLAG_EARLY_CANCELLATION,
+    FLAG_MISSING_BILLING_TRIGGER,
+    FLAG_MISSING_TIER,
+    FLAG_UNMAPPED_PARTNER,
+    PRE_SCAN_RESULTS_FILE,
+)
 
 OUTPUTS_DIR = DEFAULT_OUTPUTS_DIR
 BILLING_LOG_DIR = OUTPUTS_DIR / "gep_billing_log"
 PARTNER_DETAILS_DIR = OUTPUTS_DIR / "gep_partner_details"
 NETSUITE_CSV_PATH = OUTPUTS_DIR / "gep_netsuite_invoice_import.csv"
+DATA_REVIEW_DIR = OUTPUTS_DIR / DATA_REVIEW_DIR_NAME
 
 ACCRUAL_OUTPUT_DIR = OUTPUTS_DIR / "gep_accrual"
 
@@ -626,6 +638,346 @@ def page_accruals() -> None:
                 st.markdown(f"- `{f.name}`")
 
 
+# ---------------------------------------------------------------------------
+# Data Review (Triage Gate)
+# ---------------------------------------------------------------------------
+
+_FLAG_TYPE_LABELS = {
+    FLAG_MISSING_BILLING_TRIGGER: "Missing Billing Trigger",
+    FLAG_EARLY_CANCELLATION: "Early Cancellation",
+    FLAG_DUPLICATE_UUID: "Duplicate Company UUID",
+    FLAG_UNMAPPED_PARTNER: "Unmapped Partner",
+    FLAG_MISSING_TIER: "Missing Tier / Bad Data",
+}
+
+_FLAG_TYPE_ICONS = {
+    FLAG_MISSING_BILLING_TRIGGER: "\U0001f4c5",
+    FLAG_EARLY_CANCELLATION: "\u26a0\ufe0f",
+    FLAG_DUPLICATE_UUID: "\U0001f465",
+    FLAG_UNMAPPED_PARTNER: "\U0001f50c",
+    FLAG_MISSING_TIER: "\U0001f4b2",
+}
+
+
+def _load_pre_scan() -> Optional[Dict[str, Any]]:
+    results_path = DATA_REVIEW_DIR / PRE_SCAN_RESULTS_FILE
+    if not results_path.exists():
+        return None
+    try:
+        with results_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _overrides_path() -> Path:
+    return DATA_REVIEW_DIR / BILLING_OVERRIDES_FILE
+
+
+def _load_overrides() -> Dict[str, Any]:
+    p = _overrides_path()
+    if not p.exists():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_overrides(data: Dict[str, Any]) -> None:
+    DATA_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    with _overrides_path().open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _confirmed_decisions() -> Dict[str, Dict[str, Any]]:
+    """Return decisions that have been individually confirmed (persisted)."""
+    overrides = _load_overrides()
+    return {d["flag_id"]: d for d in overrides.get("decisions", []) if d.get("confirmed")}
+
+
+def _save_single_decision(scan: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    """Persist one confirmed decision into the overrides file."""
+    from datetime import datetime as _dt, timezone as _tz
+    overrides = _load_overrides()
+    if not overrides:
+        overrides = {
+            "usage_file_sha256": scan.get("usage_file", {}).get("sha256", ""),
+            "for_month": scan.get("for_month", ""),
+            "decisions": [],
+        }
+    existing = overrides.setdefault("decisions", [])
+    existing = [d for d in existing if d.get("flag_id") != decision["flag_id"]]
+    existing.append(decision)
+    overrides["decisions"] = existing
+    overrides["last_updated_utc"] = (
+        _dt.now(_tz.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    _save_overrides(overrides)
+
+
+def page_data_review() -> None:
+    from datetime import datetime as _dt, timezone as _tz
+
+    scan = _load_pre_scan()
+
+    if scan is None:
+        st.info(
+            "No data review pending. When the watcher detects a new usage file "
+            "it will run a pre-scan and results will appear here."
+        )
+        return
+
+    # --- Header ---
+    total_flags = scan.get("total_flags", 0)
+    for_month = scan.get("for_month", "Unknown")
+    usage_name = scan.get("usage_file", {}).get("name", "")
+    total_rows = scan.get("total_usage_rows", 0)
+
+    confirmed = _confirmed_decisions()
+    current_flag_ids = {f["flag_id"] for f in scan.get("flags", [])}
+    confirmed_count = sum(1 for fid in confirmed if fid in current_flag_ids)
+    remaining = total_flags - confirmed_count
+
+    # Check if all flags are confirmed (review complete).
+    all_confirmed = total_flags > 0 and remaining == 0
+
+    if total_flags == 0:
+        st.success(
+            f"Pre-scan is clean — no flags found for **{for_month}** "
+            f"({total_rows:,} rows in `{usage_name}`). "
+            f"You can approve to proceed with billing.",
+            icon="\u2705",
+        )
+    elif all_confirmed:
+        st.success(
+            f"All **{total_flags} flag(s)** reviewed for **{for_month}** "
+            f"({total_rows:,} rows). Ready to proceed to billing.",
+            icon="\u2705",
+        )
+    else:
+        st.warning(
+            f"**{remaining} of {total_flags} flag(s)** still need review "
+            f"for **{for_month}** ({total_rows:,} rows in `{usage_name}`).",
+            icon="\u26a0\ufe0f",
+        )
+
+    # Summary metrics.
+    flags_by_type = scan.get("flags_by_type", {})
+    if flags_by_type:
+        metric_cols = st.columns(len(flags_by_type) + 1)
+        for i, (ftype, count) in enumerate(flags_by_type.items()):
+            icon = _FLAG_TYPE_ICONS.get(ftype, "")
+            metric_cols[i].metric(
+                f"{icon} {_FLAG_TYPE_LABELS.get(ftype, ftype)}", count,
+            )
+        done_count = confirmed_count
+        metric_cols[-1].metric("\u2705 Confirmed", f"{done_count} / {total_flags}")
+
+    st.markdown("---")
+
+    # --- Build action controls for each flag ---
+    flags = scan.get("flags", [])
+    all_partners = scan.get("all_partners", [])
+    partner_options = [
+        p.get("partner_name", p.get("partner_key", "")) for p in all_partners
+    ]
+
+    # Group flags by type for organized display.
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for flag in flags:
+        grouped.setdefault(flag["flag_type"], []).append(flag)
+
+    for flag_type, type_flags in grouped.items():
+        label = _FLAG_TYPE_LABELS.get(flag_type, flag_type)
+        icon = _FLAG_TYPE_ICONS.get(flag_type, "")
+        type_confirmed = sum(1 for f in type_flags if f["flag_id"] in confirmed)
+        st.markdown(
+            f"### {icon} {label} "
+            f"({type_confirmed}/{len(type_flags)} confirmed)"
+        )
+
+        for flag in type_flags:
+            fid = flag["flag_id"]
+            scope = flag.get("scope", "row")
+            is_confirmed = fid in confirmed
+
+            # Build summary line.
+            if scope == "partner":
+                affected_count = len(flag.get("affected_row_indices", []))
+                summary_text = (
+                    f"**{flag.get('PARTNER_NAME', '')}** "
+                    f"(ID: {flag.get('PARTNER_ID', 'N/A')}) — "
+                    f"{affected_count} row(s) affected"
+                )
+            else:
+                summary_text = (
+                    f"**{flag.get('ER_NAME', '')}** "
+                    f"(UUID: `{flag.get('COMPANY_UUID', '')}`) — "
+                    f"Partner: {flag.get('PARTNER_NAME', '')} — "
+                    f"Users: {flag.get('TOTAL_INDIVIDUAL_USERS', '')}"
+                )
+
+            # --- Confirmed state: show locked decision ---
+            if is_confirmed:
+                saved = confirmed[fid]
+                action_key = saved.get("action", "keep")
+                detail_parts = []
+                if action_key == "remove":
+                    detail_parts.append("**Removed from billing**")
+                elif action_key == "keep":
+                    detail_parts.append("**Kept as-is**")
+                else:
+                    detail_parts.append("**Kept with adjustments**")
+                if saved.get("set_date"):
+                    detail_parts.append(
+                        f"Date set to {saved['set_date']}"
+                    )
+                if saved.get("reassign_to_partner_name"):
+                    detail_parts.append(
+                        f"Reassigned to {saved['reassign_to_partner_name']}"
+                    )
+                with st.container(border=True):
+                    c1, c2 = st.columns([5, 1])
+                    with c1:
+                        st.markdown(f"\u2705 {summary_text}")
+                        st.caption(" · ".join(detail_parts))
+                    with c2:
+                        if st.button("Undo", key=f"undo_{fid}", type="secondary"):
+                            overrides = _load_overrides()
+                            overrides["decisions"] = [
+                                d for d in overrides.get("decisions", [])
+                                if d.get("flag_id") != fid
+                            ]
+                            _save_overrides(overrides)
+                            st.rerun()
+                continue
+
+            # --- Unconfirmed: show action controls ---
+            with st.container(border=True):
+                st.markdown(summary_text)
+                st.caption(flag.get("flag_reason", ""))
+
+                # Primary action: remove or keep.
+                remove = st.checkbox(
+                    "Remove from billing",
+                    key=f"remove_{fid}",
+                    value=False,
+                )
+
+                set_date_value = ""
+                reassign_target = ""
+                reassign_target_id = ""
+
+                if not remove:
+                    # Optional adjustments (can be combined).
+                    adj_col1, adj_col2 = st.columns(2)
+
+                    with adj_col1:
+                        set_date_value = st.text_input(
+                            "Set FIRST_BILLABLE_ACTIVITY_DATE",
+                            placeholder="e.g. 2/1/26",
+                            key=f"date_{fid}",
+                        )
+
+                    with adj_col2:
+                        if flag_type != FLAG_UNMAPPED_PARTNER:
+                            current_partner = flag.get("PARTNER_NAME", "")
+                            other_partners = [
+                                p for p in partner_options
+                                if p != current_partner
+                            ]
+                            if other_partners:
+                                reassign_options = ["— no change —"] + other_partners
+                                reassign_choice = st.selectbox(
+                                    "Reassign to partner",
+                                    options=reassign_options,
+                                    key=f"reassign_{fid}",
+                                )
+                                if reassign_choice != "— no change —":
+                                    reassign_target = reassign_choice
+                                    match = next(
+                                        (
+                                            p for p in all_partners
+                                            if p.get("partner_name") == reassign_target
+                                        ),
+                                        None,
+                                    )
+                                    if match:
+                                        reassign_target_id = match.get(
+                                            "partner_id", ""
+                                        )
+
+                # Build the action key from the combination of choices.
+                if remove:
+                    action_key = "remove"
+                elif set_date_value.strip() and reassign_target:
+                    action_key = "set_date_and_reassign"
+                elif set_date_value.strip():
+                    action_key = "set_date"
+                elif reassign_target:
+                    action_key = "reassign"
+                else:
+                    action_key = "keep"
+
+                if st.button("Confirm", key=f"confirm_{fid}", type="primary"):
+                    decision = {
+                        "flag_id": fid,
+                        "action": action_key,
+                        "scope": scope,
+                        "row_index": flag.get("row_index"),
+                        "affected_row_indices": flag.get("affected_row_indices"),
+                        "partner_key": flag.get("partner_key", ""),
+                        "reassign_to_partner_name": reassign_target,
+                        "reassign_to_partner_id": reassign_target_id,
+                        "set_date": set_date_value.strip(),
+                        "confirmed": True,
+                        "confirmed_at_utc": (
+                            _dt.now(_tz.utc)
+                            .replace(microsecond=0)
+                            .strftime("%Y-%m-%dT%H:%M:%SZ")
+                        ),
+                    }
+                    _save_single_decision(scan, decision)
+                    st.rerun()
+
+    # --- Partner-Company Roster ---
+    roster = scan.get("partner_company_roster", {})
+    if roster:
+        st.markdown("---")
+        with st.expander("Full Partner-Company Roster (for manual review)"):
+            for partner_name, companies in sorted(roster.items()):
+                st.markdown(f"**{partner_name}** — {len(companies)} companies")
+                roster_df = pd.DataFrame(companies)
+                st.dataframe(roster_df, use_container_width=True, hide_index=True)
+
+    # --- Final approve button ---
+    st.markdown("---")
+    if all_confirmed or total_flags == 0:
+        if st.button(
+            "Proceed to Billing" if total_flags == 0
+            else f"All {total_flags} flag(s) confirmed — Proceed to Billing",
+            type="primary",
+        ):
+            overrides = _load_overrides()
+            overrides["approved_at_utc"] = (
+                _dt.now(_tz.utc)
+                .replace(microsecond=0)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            overrides["status"] = "approved"
+            _save_overrides(overrides)
+            st.success(
+                "Approved. Billing will proceed on the next watcher cycle."
+            )
+            st.rerun()
+    else:
+        st.info(
+            f"{remaining} flag(s) still need review before billing can proceed."
+        )
+
+
 _GUSTO_CSS = """
 <style>
 /* ---------- Gusto brand tokens ---------- */
@@ -758,12 +1110,16 @@ def main() -> None:
     st.title("GEP Billing Dashboard")
     st.caption("Automated billing monitoring — no uploads, no buttons. Just results.")
 
-    tab_overview, tab_accruals, tab_history, tab_watcher = st.tabs([
+    tab_review, tab_overview, tab_accruals, tab_history, tab_watcher = st.tabs([
+        "Data Review",
         "Latest Run",
         "Accruals",
         "Run History",
         "Watcher Status",
     ])
+
+    with tab_review:
+        page_data_review()
 
     with tab_overview:
         page_overview()

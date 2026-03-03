@@ -33,12 +33,16 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from billing_engine import (
+    BILLING_OVERRIDES_FILE,
     BillingEngineError,
+    DATA_REVIEW_DIR_NAME,
     DEFAULT_CONFIG_FILE,
     DEFAULT_INPUTS_DIR,
     DEFAULT_OUTPUTS_DIR,
     DEFAULT_USAGE_PREFIX,
+    PRE_SCAN_RESULTS_FILE,
     run_billing_engine,
+    run_pre_scan,
 )
 from accrual_engine import (
     DEFAULT_ACCRUAL_OUTPUT_DIR,
@@ -320,6 +324,102 @@ def _execute_accrual_run(
 
 
 # ---------------------------------------------------------------------------
+# Pre-scan execution (Data Triage Gate)
+# ---------------------------------------------------------------------------
+def _execute_pre_scan(
+    usage_file: Path,
+    rules_dir: Path,
+    outputs_dir: Path,
+    config_filename: str,
+) -> Dict[str, Any]:
+    """Run the data quality pre-scan for a usage file.
+
+    Returns a record with scan results metadata for the ledger.
+    """
+    created_at = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    file_hash = _file_sha256(usage_file)
+
+    record: Dict[str, Any] = {
+        "created_at_utc": created_at,
+        "status": "scanning",
+        "usage_file_name": usage_file.name,
+        "usage_file_path": str(usage_file),
+        "usage_file_sha256": file_hash,
+    }
+
+    logger.info("=" * 60)
+    logger.info("PRE-SCAN STARTING  [%s]", usage_file.name)
+    logger.info("=" * 60)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="gep_prescan_") as tmp:
+            tmp_inputs = Path(tmp) / "inputs"
+            tmp_inputs.mkdir()
+            shutil.copy2(usage_file, tmp_inputs / f"{DEFAULT_USAGE_PREFIX}.csv")
+            rules_src = rules_dir / config_filename
+            if rules_src.exists():
+                shutil.copy2(rules_src, tmp_inputs / config_filename)
+
+            results_path = run_pre_scan(
+                inputs_dir=tmp_inputs,
+                outputs_dir=outputs_dir,
+                usage_prefix=DEFAULT_USAGE_PREFIX,
+                config_filename=config_filename,
+                logger=logger,
+            )
+
+        with results_path.open("r", encoding="utf-8") as f:
+            scan_data = json.load(f)
+
+        total_flags = scan_data.get("total_flags", 0)
+        scan_status = scan_data.get("status", "unknown")
+
+        record.update({
+            "status": "awaiting_review" if total_flags > 0 else "clean",
+            "scan_completed_at_utc": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "pre_scan_results_path": str(results_path),
+            "total_flags": total_flags,
+            "scan_status": scan_status,
+            "for_month": scan_data.get("for_month", ""),
+        })
+
+        if total_flags > 0:
+            logger.info(
+                "PRE-SCAN COMPLETE  [%s] — %d flag(s) require review",
+                usage_file.name, total_flags,
+            )
+        else:
+            logger.info(
+                "PRE-SCAN COMPLETE  [%s] — clean, no flags",
+                usage_file.name,
+            )
+
+    except Exception:
+        tb = traceback.format_exc()
+        record.update({
+            "status": "scan_failed",
+            "scan_completed_at_utc": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "error": tb,
+        })
+        logger.error("PRE-SCAN FAILED  [%s]\n%s", usage_file.name, tb)
+
+    return record
+
+
+def _check_overrides_ready(outputs_dir: Path) -> bool:
+    """Return True if an approved billing overrides file exists."""
+    overrides_path = outputs_dir / DATA_REVIEW_DIR_NAME / BILLING_OVERRIDES_FILE
+    if not overrides_path.exists():
+        return False
+    try:
+        with overrides_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("status") == "approved"
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Billing run execution
 # ---------------------------------------------------------------------------
 def _execute_billing_run(
@@ -468,6 +568,45 @@ def run_watcher(
 
     while not _shutdown_requested:
         try:
+            # --- Check for files awaiting review that now have overrides ---
+            for file_key, entry in list(ledger["processed"].items()):
+                if entry.get("status") != "awaiting_review":
+                    continue
+                if not _check_overrides_ready(outputs_dir):
+                    continue
+
+                usage_path = Path(entry.get("usage_file_path", ""))
+                if not usage_path.exists():
+                    logger.warning(
+                        "Usage file for awaiting review entry no longer exists: %s",
+                        usage_path,
+                    )
+                    continue
+
+                logger.info(
+                    "Overrides approved for %s — proceeding to billing.",
+                    file_key,
+                )
+                record = _execute_billing_run(
+                    usage_file=usage_path,
+                    rules_dir=rules_dir,
+                    outputs_dir=outputs_dir,
+                    config_filename=config_filename,
+                    slack_webhook=slack_webhook,
+                )
+
+                entry.update({
+                    "run_id": record.get("run_id"),
+                    "status": record.get("status"),
+                    "billing_period": record.get("billing_period"),
+                    "processed_at_utc": (
+                        record.get("completed_at_utc")
+                        or record.get("created_at_utc")
+                    ),
+                    "note": "ran after data review approval",
+                })
+                _save_ledger(ledger)
+
             # --- Usage file processing ---
             candidates = _find_usage_candidates(usage_dir)
 
@@ -509,6 +648,51 @@ def run_watcher(
                     _save_ledger(ledger)
                     continue
 
+                # Phase 1: Run pre-scan (data triage gate).
+                scan_record = _execute_pre_scan(
+                    usage_file=usage_file,
+                    rules_dir=rules_dir,
+                    outputs_dir=outputs_dir,
+                    config_filename=config_filename,
+                )
+
+                if scan_record.get("status") == "awaiting_review":
+                    logger.info(
+                        "File %s has %d flag(s) — waiting for review in dashboard.",
+                        usage_file.name, scan_record.get("total_flags", 0),
+                    )
+                    ledger["processed"][file_key] = {
+                        "sha256": file_hash,
+                        "status": "awaiting_review",
+                        "usage_file_path": str(usage_file),
+                        "pre_scan_at_utc": scan_record.get("scan_completed_at_utc"),
+                        "total_flags": scan_record.get("total_flags", 0),
+                        "for_month": scan_record.get("for_month", ""),
+                    }
+                    _save_ledger(ledger)
+
+                    if slack_webhook:
+                        _send_slack(slack_webhook, {
+                            "status": "awaiting_review",
+                            "run_id": f"prescan-{file_key}",
+                            "billing_period": scan_record.get("for_month", ""),
+                            "usage_file_name": usage_file.name,
+                            "outputs_dir": str(outputs_dir),
+                            "audit_rows": [],
+                        })
+                    continue
+
+                if scan_record.get("status") == "scan_failed":
+                    ledger["processed"][file_key] = {
+                        "sha256": file_hash,
+                        "status": "scan_failed",
+                        "error": scan_record.get("error", ""),
+                        "detected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                    _save_ledger(ledger)
+                    continue
+
+                # Phase 2: Clean scan — proceed directly to billing.
                 record = _execute_billing_run(
                     usage_file=usage_file,
                     rules_dir=rules_dir,
