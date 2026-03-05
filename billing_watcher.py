@@ -114,17 +114,33 @@ def _file_sha256(path: Path) -> str:
 _USAGE_DATE_PREFIX = re.compile(r"^(\d{4})\.(\d{1,2})_")
 
 
-def _find_usage_candidates(watch_dir: Path) -> List[Path]:
-    """Return YYYY.MM_*.csv files sorted newest-first by modification time."""
+def _find_usage_candidates(watch_dir: Path, max_age_months: int = 2) -> List[Path]:
+    """Return YYYY.MM_*.csv files sorted newest-first by modification time.
+
+    Only includes files whose billing period (YYYY.MM prefix) is within
+    *max_age_months* of the current month so historical archive files
+    sitting in the same directory are ignored.
+    """
     if not watch_dir.exists():
         return []
-    candidates = [
-        p
-        for p in watch_dir.iterdir()
-        if p.is_file()
-        and p.suffix.lower() == ".csv"
-        and _USAGE_DATE_PREFIX.match(p.name)
-    ]
+
+    now = datetime.now(timezone.utc).date()
+    total_months = now.year * 12 + (now.month - 1) - max_age_months
+    cutoff_year, cutoff_month_0 = divmod(total_months, 12)
+    cutoff_ym = cutoff_year * 100 + cutoff_month_0 + 1
+
+    candidates = []
+    for p in watch_dir.iterdir():
+        if not p.is_file() or p.suffix.lower() != ".csv":
+            continue
+        m = _USAGE_DATE_PREFIX.match(p.name)
+        if not m:
+            continue
+        file_ym = int(m.group(1)) * 100 + int(m.group(2))
+        if file_ym < cutoff_ym:
+            continue
+        candidates.append(p)
+
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates
 
@@ -528,6 +544,9 @@ def _execute_billing_run(
 # ---------------------------------------------------------------------------
 # Core polling loop
 # ---------------------------------------------------------------------------
+DEFAULT_MAX_AGE_MONTHS = 2
+
+
 def run_watcher(
     rules_dir: Path,
     outputs_dir: Path,
@@ -539,6 +558,7 @@ def run_watcher(
     accrual_day: int = DEFAULT_ACCRUAL_DAY,
     accrual_output_dir: Optional[Path] = None,
     disable_accrual: bool = False,
+    max_age_months: int = DEFAULT_MAX_AGE_MONTHS,
 ) -> None:
     """Poll usage_dir for new YYYY.MM_*.csv files and run billing when found.
 
@@ -562,6 +582,7 @@ def run_watcher(
     logger.info("  Slack:         %s", "configured" if slack_webhook else "not configured")
     logger.info("  Dry run:       %s", dry_run)
     logger.info("  Accrual:       %s (day %d)", "disabled" if disable_accrual else "enabled", accrual_day)
+    logger.info("  Max age:       %d months", max_age_months)
     logger.info("  Ledger:        %s", PROCESSED_LEDGER)
     logger.info("  Processed so far: %d file(s)", len(ledger["processed"]))
     logger.info("=" * 60)
@@ -608,7 +629,7 @@ def run_watcher(
                 _save_ledger(ledger)
 
             # --- Usage file processing ---
-            candidates = _find_usage_candidates(usage_dir)
+            candidates = _find_usage_candidates(usage_dir, max_age_months=max_age_months)
 
             for usage_file in candidates:
                 file_key = usage_file.name
@@ -814,6 +835,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable automatic accrual scheduling.",
     )
+    parser.add_argument(
+        "--max-age-months",
+        type=int,
+        default=DEFAULT_MAX_AGE_MONTHS,
+        help=(
+            f"Only process usage files from the last N billing periods "
+            f"(default: {DEFAULT_MAX_AGE_MONTHS}). Older files in the watch "
+            f"directory are ignored."
+        ),
+    )
     return parser
 
 
@@ -856,6 +887,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             accrual_day=args.accrual_day,
             accrual_output_dir=accrual_output_dir,
             disable_accrual=args.disable_accrual,
+            max_age_months=args.max_age_months,
         )
     except BillingEngineError as exc:
         logger.error("%s", exc)

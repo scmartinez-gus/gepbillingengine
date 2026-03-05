@@ -135,10 +135,7 @@ PREFERRED_OUTPUT_COLUMNS = [
 ]
 
 PARTNER_DETAIL_CALC_COLUMNS = [
-    "tier_start",
-    "tier_end",
     "er_fee",
-    "unit_price_iu",
     "iu_fee",
     "total_fee",
 ]
@@ -147,13 +144,10 @@ PARTNER_DETAIL_INTEGER_COLUMNS = [
     "ACTIVE_EMPLOYEES",
     "NUMBER_ACTIVE_CONTRACTORS",
     "TOTAL_INDIVIDUAL_USERS",
-    "tier_start",
-    "tier_end",
 ]
 
 PARTNER_DETAIL_FINANCIAL_COLUMNS = [
     "er_fee",
-    "unit_price_iu",
     "iu_fee",
     "total_fee",
 ]
@@ -703,7 +697,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Memo": memo,
                     "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
                     "Item": "Embedded Payroll",
-                    "Description": f"End Users - {end_user_quantity} total",
+                    "Description": "End Users",
                     "Quantity": 1,
                     "Amount": end_users_amount,
                     "Product": "GEP Usage",
@@ -726,7 +720,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                     "Memo": memo,
                     "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
                     "Item": "Embedded Payroll",
-                    "Description": f"Individual Users - {int(individual_quantity)} total",
+                    "Description": "Individual Users",
                     "Quantity": 1,
                     "Amount": individual_users_amount,
                     "Product": "GEP Usage",
@@ -757,7 +751,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                         "Memo": memo,
                         "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
                         "Item": "Embedded Payroll : Next-Day Direct Deposit",
-                        "Description": f"End Users - {nd_er_count} total",
+                        "Description": "End Users",
                         "Quantity": 1,
                         "Amount": nd_er_amount,
                         "Product": "GEP Next-Day Direct Deposit",
@@ -781,7 +775,7 @@ def generate_netsuite_import_file(df_usage: pd.DataFrame, output_path: Path) -> 
                         "Memo": memo,
                         "Transaction Date": transaction_date.strftime("%m/%d/%Y"),
                         "Item": "Embedded Payroll : Next-Day Direct Deposit",
-                        "Description": f"Individual Users - {int(nd_iu_count)} total",
+                        "Description": "Individual Users",
                         "Quantity": 1,
                         "Amount": nd_iu_amount,
                         "Product": "GEP Next-Day Direct Deposit",
@@ -838,6 +832,7 @@ def generate_master_billing_report(
     output_path: Path,
     dq_flags: Optional[pd.DataFrame] = None,
     override_audit_log: Optional[List[Dict[str, Any]]] = None,
+    partner_recon: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Create a three-tab master billing dashboard workbook with audit controls."""
     data = df_usage.copy()
@@ -1059,6 +1054,25 @@ def generate_master_billing_report(
             "Status": "PASS" if dq_flag_count == 0 else "REVIEW REQUIRED",
         }
     )
+
+    if partner_recon is not None:
+        master_usage_total = round2(
+            pd.to_numeric(usage["total_fee"], errors="coerce").fillna(0).sum()
+        )
+        partner_detail_total = round2(sum(r["detail_total"] for r in partner_recon))
+        recon_variance = round2(partner_detail_total - master_usage_total)
+        recon_failures = [r for r in partner_recon if r["status"] == "FAIL"]
+        recon_passed = len(recon_failures) == 0 and abs(recon_variance) < 0.01
+        audit_rows.append(
+            {
+                "Control Check": "Partner Report Tie-Out",
+                "Input": master_usage_total,
+                "Output": partner_detail_total,
+                "Variance": recon_variance,
+                "Status": "PASS" if recon_passed else "FAIL",
+            }
+        )
+
     audit_df = pd.DataFrame(
         audit_rows,
         columns=["Control Check", "Input", "Output", "Variance", "Status"],
@@ -1350,18 +1364,250 @@ def _build_partner_lookups(
     }
 
 
+def _build_tier_label(tier_start: Any, tier_end: Any) -> str:
+    """Format a human-readable tier range label, or empty string for catch-all tiers."""
+    ts = num(tier_start)
+    te = num(tier_end)
+    ts_int = int(ts)
+    if te > 0 and math.isfinite(te):
+        te_int = int(te)
+        if ts_int <= 1 and te_int >= 999_999:
+            return ""
+        return f"{ts_int} \u2013 {te_int}"
+    if ts_int > 1:
+        return f"{ts_int}+"
+    return ""
+
+
+def _write_usage_summary_sheet(
+    workbook: Any,
+    group: pd.DataFrame,
+    partner_display: str,
+    period_str: str,
+    has_next_day_fees: bool,
+) -> None:
+    """Write the Fee Summary sheet as the first sheet in a partner workbook."""
+    ws = workbook.add_worksheet("Fee Summary")
+    ws.hide_gridlines(2)
+    ws.set_column("A:A", 40)
+    ws.set_column("B:B", 24)
+    ws.set_column("C:C", 30)
+    ws.set_column("D:D", 18)
+
+    fmt_title = workbook.add_format({
+        "bold": True, "font_size": 14, "font_color": "#1F2937",
+        "bottom": 2, "bottom_color": "#D1D5DB",
+    })
+    fmt_lbl = workbook.add_format({
+        "bold": True, "font_color": "#6B7280", "font_size": 11,
+    })
+    fmt_val = workbook.add_format({"font_size": 11, "font_color": "#1F2937"})
+    fmt_col = workbook.add_format({
+        "bold": True, "font_size": 11, "font_color": "#FFFFFF",
+        "bg_color": "#374151", "border": 1, "border_color": "#D1D5DB",
+        "text_wrap": True, "valign": "vcenter",
+    })
+    fmt_cell = workbook.add_format({
+        "font_size": 11, "border": 1, "border_color": "#E5E7EB",
+        "valign": "vcenter",
+    })
+    fmt_money = workbook.add_format({
+        "font_size": 11, "num_format": "#,##0.00",
+        "border": 1, "border_color": "#E5E7EB", "valign": "vcenter",
+    })
+    fmt_tot_lbl = workbook.add_format({
+        "bold": True, "font_size": 11, "border": 1, "border_color": "#D1D5DB",
+        "bg_color": "#F3F4F6", "valign": "vcenter",
+    })
+    fmt_tot_money = workbook.add_format({
+        "bold": True, "font_size": 11, "num_format": "#,##0.00",
+        "border": 1, "border_color": "#D1D5DB",
+        "bg_color": "#F3F4F6", "valign": "vcenter",
+    })
+    fmt_note = workbook.add_format({
+        "italic": True, "font_size": 10, "font_color": "#9CA3AF",
+    })
+
+    usage_mask = group["row_type"].fillna("").astype(str).str.lower() == "usage"
+    usage = group.loc[usage_mask]
+    if usage.empty:
+        usage = group
+
+    num_companies = len(usage)
+    total_iu = int(pd.to_numeric(usage["TOTAL_INDIVIDUAL_USERS"], errors="coerce").fillna(0).sum())
+    total_er_fees = pd.to_numeric(usage["er_fee"], errors="coerce").fillna(0).sum()
+    total_iu_fees = pd.to_numeric(usage["iu_fee"], errors="coerce").fillna(0).sum()
+
+    # --- Title + header block ---
+    row = 0
+    ws.merge_range(row, 0, row, 3, "Gusto Embedded Fee Summary", fmt_title)
+    row += 2
+    for label, value in [
+        ("Partner", partner_display),
+        ("Period", period_str),
+        ("Total Companies", num_companies),
+        ("Total Individual Users", total_iu),
+    ]:
+        ws.write(row, 0, label, fmt_lbl)
+        ws.write(row, 1, value, fmt_val)
+        row += 1
+    row += 1
+
+    # --- Column headers ---
+    for ci, hdr in enumerate(["Product Summary", "Rate", "Quantity", "Amount"]):
+        ws.write(row, ci, hdr, fmt_col)
+    row += 1
+
+    # --- Determine if multiple tiers exist ---
+    _ts_col = pd.Series([str(v) if pd.notna(v) else "" for v in usage["tier_start"]], index=usage.index)
+    _te_col = pd.Series([str(v) if pd.notna(v) else "" for v in usage["tier_end"]], index=usage.index)
+    tier_pairs = pd.DataFrame({"tier_start": _ts_col, "tier_end": _te_col}).drop_duplicates()
+    multi_tier = len(tier_pairs) > 1
+
+    charges: List[Dict[str, Any]] = []
+
+    if multi_tier:
+        for _, tp in tier_pairs.iterrows():
+            ts, te = tp["tier_start"], tp["tier_end"]
+            mask = (_ts_col == ts) & (_te_col == te)
+            bucket = usage.loc[mask]
+            bucket_cos = len(bucket)
+            bucket_iu = int(pd.to_numeric(bucket["TOTAL_INDIVIDUAL_USERS"], errors="coerce").fillna(0).sum())
+            bucket_er_total = round(float(pd.to_numeric(bucket["er_fee"], errors="coerce").fillna(0).sum()), 2)
+            bucket_iu_total = round(float(pd.to_numeric(bucket["iu_fee"], errors="coerce").fillna(0).sum()), 2)
+            unit_er = num(bucket["unit_price_er"].iloc[0])
+            unit_iu = num(bucket["unit_price_iu"].iloc[0])
+            incl = int(num(bucket["included_users_in_company_fee"].iloc[0]))
+            tier_lbl = _build_tier_label(ts, te)
+            tier_suffix = f" (Tier: {tier_lbl})" if tier_lbl else ""
+
+            if unit_er > 0:
+                charges.append({
+                    "charge": f"Company Fee{tier_suffix}",
+                    "rate": f"{unit_er:,.2f} / company",
+                    "quantity": f"{bucket_cos} companies",
+                    "amount": bucket_er_total,
+                })
+            if unit_iu > 0:
+                desc = f"Individual User Fee{tier_suffix}"
+                if incl > 0:
+                    included_total = bucket_cos * incl
+                    billable = bucket_iu - included_total
+                    desc += f" ({incl} included per company)"
+                    qty = f"{billable} billable of {bucket_iu} total"
+                else:
+                    qty = f"{bucket_iu} users"
+                charges.append({"charge": desc, "rate": f"{unit_iu:,.2f} / user", "quantity": qty, "amount": bucket_iu_total})
+    else:
+        first = usage.iloc[0]
+        unit_er = num(first.get("unit_price_er", 0))
+        unit_iu = num(first.get("unit_price_iu", 0))
+        incl = int(num(first.get("included_users_in_company_fee", 0)))
+        tier_lbl = _build_tier_label(first.get("tier_start", ""), first.get("tier_end", ""))
+        tier_suffix = f" (Tier: {tier_lbl})" if tier_lbl else ""
+
+        if unit_er > 0:
+            charges.append({
+                "charge": f"Company Fee{tier_suffix}",
+                "rate": f"{unit_er:,.2f} / company",
+                "quantity": f"{num_companies} companies",
+                "amount": round(float(total_er_fees), 2),
+            })
+        if unit_iu > 0:
+            desc = "Individual User Fee"
+            if incl > 0:
+                total_included = num_companies * incl
+                billable = total_iu - total_included
+                desc += f" ({incl} included per company)"
+                qty = f"{billable} billable of {total_iu} total"
+            else:
+                qty = f"{total_iu} users"
+            if tier_suffix and unit_er == 0:
+                desc += tier_suffix
+            elif tier_suffix:
+                desc += f" {tier_suffix.strip()}"
+                desc = desc.replace("  ", " ")
+            charges.append({"charge": desc, "rate": f"{unit_iu:,.2f} / user", "quantity": qty, "amount": round(float(total_iu_fees), 2)})
+
+    if has_next_day_fees:
+        nd_er = pd.to_numeric(usage["next_day_er_fee"], errors="coerce").fillna(0)
+        nd_iu = pd.to_numeric(usage["next_day_iu_fee"], errors="coerce").fillna(0)
+        nd_er_sum = round(float(nd_er.sum()), 2)
+        nd_iu_sum = round(float(nd_iu.sum()), 2)
+        if nd_er_sum > 0:
+            nd_er_cos = int((nd_er > 0).sum())
+            nd_er_unit = round(nd_er_sum / nd_er_cos, 2) if nd_er_cos else 0
+            charges.append({
+                "charge": "Next-Day ACH \u2013 Company",
+                "rate": f"{nd_er_unit:,.2f} / company",
+                "quantity": f"{nd_er_cos} companies",
+                "amount": nd_er_sum,
+            })
+        if nd_iu_sum > 0:
+            nd_iu_mask = nd_iu > 0
+            nd_iu_unit = num(usage.loc[nd_iu_mask, "unit_price_next_day_iu"].iloc[0])
+            nd_iu_users = int(pd.to_numeric(
+                usage.loc[nd_iu_mask, "user_fee_units_charged"], errors="coerce",
+            ).fillna(0).sum())
+            charges.append({
+                "charge": "Next-Day ACH \u2013 Individual User",
+                "rate": f"{nd_iu_unit:,.2f} / user",
+                "quantity": f"{nd_iu_users} users",
+                "amount": nd_iu_sum,
+            })
+
+    # --- Minimum true-up ---
+    min_mask = group["row_type"].fillna("").astype(str).str.lower() == "min_trueup"
+    min_rows = group.loc[min_mask]
+    if not min_rows.empty:
+        min_shortfall = round(float(pd.to_numeric(min_rows["total_fee"], errors="coerce").fillna(0).sum()), 2)
+        min_amount = num(min_rows["partner_minimum_amount"].iloc[0])
+        if min_shortfall > 0:
+            charges.append({
+                "charge": f"Monthly Minimum True-Up (minimum: {min_amount:,.2f})",
+                "rate": "",
+                "quantity": "",
+                "amount": min_shortfall,
+            })
+
+    # --- Write charge rows ---
+    for charge in charges:
+        ws.write(row, 0, charge["charge"], fmt_cell)
+        ws.write(row, 1, charge["rate"], fmt_cell)
+        ws.write(row, 2, charge["quantity"], fmt_cell)
+        ws.write(row, 3, charge["amount"], fmt_money)
+        row += 1
+
+    # --- Total row ---
+    total_amount = sum(c["amount"] for c in charges)
+    ws.write(row, 0, "", fmt_tot_lbl)
+    ws.write(row, 1, "", fmt_tot_lbl)
+    ws.write(row, 2, "Total Fees", fmt_tot_lbl)
+    ws.write(row, 3, total_amount, fmt_tot_money)
+    row += 2
+
+    # --- Disclaimer ---
+    ws.merge_range(row, 0, row, 3,
+        "This report reflects calculated fees. "
+        "Final invoice amounts may differ due to adjustments, credits, or discounts.",
+        fmt_note,
+    )
+
+
 def _write_partner_detail_files(
     master_df: pd.DataFrame,
     partner_dir: Path,
     for_month_any: date,
     usage_source_columns: List[str],
     logger: logging.Logger,
-) -> None:
-    """Write per-partner detail Excel files into partner_dir sub-folders."""
+) -> List[Dict[str, Any]]:
+    """Write per-partner detail Excel files and return reconciliation data."""
     if "PARTNER_NAME" not in master_df.columns:
         raise BillingEngineError("PARTNER_NAME column missing from output data.")
     if "FOR_MONTH" not in master_df.columns:
         raise BillingEngineError("FOR_MONTH column missing from output data.")
+
+    recon_results: List[Dict[str, Any]] = []
 
     for partner_name, group in master_df.groupby("PARTNER_NAME", dropna=False):
         group_partner_name = key(partner_name)
@@ -1418,47 +1664,100 @@ def _write_partner_detail_files(
             if col not in detail_columns:
                 detail_columns.append(col)
         if has_next_day_fees:
-            for col in ["next_day_er_fee", "unit_price_next_day_iu", "next_day_iu_fee"]:
+            for col in ["next_day_er_fee", "next_day_iu_fee"]:
                 if col not in detail_columns:
                     detail_columns.append(col)
         if "total_fee" in detail_columns:
             detail_columns = [col for col in detail_columns if col != "total_fee"] + ["total_fee"]
 
         detail_df = group.copy()
+        if "row_type" in detail_df.columns:
+            detail_df = detail_df[detail_df["row_type"].fillna("").astype(str).str.lower() != "min_trueup"]
         for col in detail_columns:
             if col not in detail_df.columns:
                 detail_df[col] = ""
         detail_df = detail_df.loc[:, detail_columns]
 
-        for col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+        if "NUMBER_ACTIVE_CONTRACTORS" in detail_df.columns:
+            detail_df = detail_df.rename(columns={"NUMBER_ACTIVE_CONTRACTORS": "ACTIVE_CONTRACTORS"})
+
+        integer_columns = [
+            c if c != "NUMBER_ACTIVE_CONTRACTORS" else "ACTIVE_CONTRACTORS"
+            for c in PARTNER_DETAIL_INTEGER_COLUMNS
+        ]
+        for col_name in integer_columns:
             if col_name in detail_df.columns:
                 detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
 
         financial_columns = set(PARTNER_DETAIL_FINANCIAL_COLUMNS)
         if has_next_day_fees:
-            financial_columns.update({"unit_price_next_day_iu", "next_day_er_fee", "next_day_iu_fee"})
+            financial_columns.update({"next_day_er_fee", "next_day_iu_fee"})
         for col_name in financial_columns:
             if col_name in detail_df.columns:
                 detail_df[col_name] = pd.to_numeric(detail_df[col_name], errors="coerce").fillna(0)
 
+        period_display = parsed_month.strftime("%B %Y")
+
         with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
-            sheet_name = "Partner Detail"
+            workbook = writer.book
+            _write_usage_summary_sheet(workbook, group, partner_display, period_display, has_next_day_fees)
+
+            sheet_name = "Fee Detail"
             detail_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
-            workbook = writer.book
             worksheet = writer.sheets[sheet_name]
             fmt_int = workbook.add_format({"num_format": "0"})
             fmt_money = workbook.add_format({"num_format": "#,##0.00"})
 
             for col_idx, col_name in enumerate(detail_df.columns):
                 col_fmt = None
-                if col_name in PARTNER_DETAIL_INTEGER_COLUMNS:
+                if col_name in integer_columns:
                     col_fmt = fmt_int
                 elif col_name in financial_columns:
                     col_fmt = fmt_money
                 worksheet.set_column(col_idx, col_idx, 18, col_fmt)
 
         logger.info("Wrote partner detail file: %s", file_path)
+
+        # --- Reconciliation: compare detail_df totals against master group ---
+        usage_mask = group["row_type"].fillna("").astype(str).str.lower() == "usage"
+        master_usage = group.loc[usage_mask] if usage_mask.any() else group
+        master_rows = len(master_usage)
+        master_er = round2(pd.to_numeric(master_usage["er_fee"], errors="coerce").fillna(0).sum())
+        master_iu = round2(pd.to_numeric(master_usage["iu_fee"], errors="coerce").fillna(0).sum())
+        master_total = round2(pd.to_numeric(master_usage["total_fee"], errors="coerce").fillna(0).sum())
+
+        detail_rows = len(detail_df)
+        detail_er = round2(detail_df["er_fee"].sum()) if "er_fee" in detail_df.columns else 0.0
+        detail_iu = round2(detail_df["iu_fee"].sum()) if "iu_fee" in detail_df.columns else 0.0
+        detail_total = round2(detail_df["total_fee"].sum()) if "total_fee" in detail_df.columns else 0.0
+
+        row_var = detail_rows - master_rows
+        er_var = round2(detail_er - master_er)
+        iu_var = round2(detail_iu - master_iu)
+        total_var = round2(detail_total - master_total)
+        passed = (
+            row_var == 0
+            and abs(er_var) < 0.01
+            and abs(iu_var) < 0.01
+            and abs(total_var) < 0.01
+        )
+
+        recon_results.append({
+            "partner": group_partner_name,
+            "master_rows": master_rows,
+            "detail_rows": detail_rows,
+            "master_er": master_er,
+            "detail_er": detail_er,
+            "master_iu": master_iu,
+            "detail_iu": detail_iu,
+            "master_total": master_total,
+            "detail_total": detail_total,
+            "total_variance": total_var,
+            "status": "PASS" if passed else "FAIL",
+        })
+
+    return recon_results
 
 
 # ---------------------------------------------------------------------------
@@ -1798,9 +2097,20 @@ def run_pre_scan(
         overrides_path.unlink()
         logger.info("Cleared stale overrides file from previous scan.")
 
-    results_path = review_dir / PRE_SCAN_RESULTS_FILE
+    results_filename = (
+        f"pre_scan_results_{for_month_str}.json"
+        if for_month_str
+        else PRE_SCAN_RESULTS_FILE
+    )
+    results_path = review_dir / results_filename
     with results_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
+
+    if for_month_str:
+        legacy_path = review_dir / PRE_SCAN_RESULTS_FILE
+        if legacy_path.exists():
+            legacy_path.unlink()
+            logger.info("Removed legacy generic pre-scan file in favour of %s.", results_filename)
 
     logger.info(
         "Pre-scan complete: %d flag(s) across %d row(s). Results: %s",
@@ -2399,14 +2709,15 @@ def run_billing_engine(
     netsuite_df = generate_netsuite_import_file(master_df, netsuite_template_path)
     logger.info("Wrote NetSuite import file: %s", netsuite_template_path)
 
+    partner_recon = _write_partner_detail_files(master_df, partner_dir, for_month_any, usage_source_columns, logger)
+
     history_file_path = history_path / f"{billing_period}_Master_Billing_Report.xlsx"
     generate_master_billing_report(
         master_df, netsuite_df, input_metrics, history_file_path,
         dq_flags=dq_flags, override_audit_log=override_audit_log,
+        partner_recon=partner_recon,
     )
     logger.info("Wrote master billing report: %s", history_file_path)
-
-    _write_partner_detail_files(master_df, partner_dir, for_month_any, usage_source_columns, logger)
 
     manifest = {
         "run_id": run_id,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import subprocess
 import zipfile
 from pathlib import Path
@@ -660,14 +661,50 @@ _FLAG_TYPE_ICONS = {
 
 
 def _load_pre_scan() -> Optional[Dict[str, Any]]:
-    results_path = DATA_REVIEW_DIR / PRE_SCAN_RESULTS_FILE
-    if not results_path.exists():
+    """Load pre-scan results for the most recent period awaiting review.
+
+    Checks the watcher ledger for ``awaiting_review`` entries and loads the
+    corresponding period-specific results file.  Falls back to the legacy
+    generic filename for backward compatibility.
+    """
+    ledger = _load_watcher_ledger()
+    processed = ledger.get("processed", {})
+
+    awaiting = sorted(
+        (
+            entry
+            for entry in processed.values()
+            if entry.get("status") == "awaiting_review" and entry.get("for_month")
+        ),
+        key=lambda e: e["for_month"],
+        reverse=True,
+    )
+
+    if not awaiting:
         return None
-    try:
-        with results_path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+
+    if not DATA_REVIEW_DIR.exists():
         return None
+
+    newest_month = awaiting[0]["for_month"]
+
+    candidates = [
+        DATA_REVIEW_DIR / f"pre_scan_results_{newest_month}.json",
+        DATA_REVIEW_DIR / PRE_SCAN_RESULTS_FILE,
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("for_month") == newest_month:
+                return data
+        except Exception:
+            continue
+
+    return None
 
 
 def _overrides_path() -> Path:
@@ -968,8 +1005,12 @@ def page_data_review() -> None:
             )
             overrides["status"] = "approved"
             _save_overrides(overrides)
+            subprocess.run(
+                ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.gep.billing-watcher"],
+                capture_output=True, timeout=5,
+            )
             st.success(
-                "Approved. Billing will proceed on the next watcher cycle."
+                "Approved. Billing is starting now."
             )
             st.rerun()
     else:
